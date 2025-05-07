@@ -4,6 +4,7 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import dotenv from "dotenv";
 import crypto from "crypto";
 import NodeCache from "node-cache";
+import path from "path";
 
 dotenv.config();
 // Initialize the Gemini API client
@@ -13,7 +14,7 @@ const genAI = new GoogleGenerativeAI(API_KEY);
 // Initialize cache with 1 hour TTL
 const pluginCache = new NodeCache({ stdTTL: 3600 });
 
-// Add this interface near the top of your file, after your imports
+// Add these interfaces near the top of your file, after your imports
 interface InconsistencyIssue {
   fileA: string;
   fileB: string;
@@ -38,11 +39,13 @@ fixRoutes.post(
     try {
       // Get JSON data from request body
       const requestData = req.body;
+      console.log("Received build error fix request");
 
       // Validate request body
       if (!requestData || !requestData.buildErrors || !requestData.files) {
         res.status(400).json({
           status: "fail",
+          success: false, // For compatibility with the Node script
           message: "Request must contain buildErrors and files fields",
         });
         return;
@@ -60,6 +63,7 @@ fixRoutes.post(
         console.log("Returning cached fix result");
         res.status(200).json({
           status: "success",
+          success: true, // For compatibility with the Node script
           message: "Files fixed successfully (cached)",
           data: cachedResult
         });
@@ -146,8 +150,10 @@ fixRoutes.post(
       Focus on fixing the ROOT CAUSE of the build failure first (like XML syntax errors in pom.xml).
     `;
 
+      console.log("Sending fix request to Gemini API");
       const fixResult = await model.generateContent(fixPrompt);
       const fixedContent = await fixResult.response.text();
+      console.log("Received fix response from Gemini API");
 
       // Extract the fixed files from the response
       const updatedFiles: Record<string, string> = {};
@@ -180,16 +186,19 @@ fixRoutes.post(
       // Cache the result
       pluginCache.set(cacheKey, updatedFiles);
 
-      // Send the fixed files as the API response
+      // Send the fixed files as the API response in a format compatible with the Node script
       res.status(200).json({
         status: "success",
+        success: true, // For compatibility with the Node script
         message: "Files fixed successfully",
         data: updatedFiles,
+        changedFiles: Object.keys(updatedFiles).length
       });
     } catch (error) {
       console.error("Error fixing build issues:", error);
       res.status(500).json({
         status: "error",
+        success: false, // For compatibility with the Node script
         message: "Failed to fix build issues",
         error: (error as Error).message,
       });
@@ -206,12 +215,13 @@ createRoutes.post(
     const requestData = req.body;
 
     // Log for debugging
-    console.log("Received data:", requestData);
+    console.log("Received plugin generation request");
 
     // Validate request body contains prompt field
     if (!requestData || !requestData.prompt) {
       res.status(400).json({
         status: "fail",
+        success: false, // For compatibility with the Node script
         message: "Request must contain a prompt field",
       });
       return;
@@ -224,13 +234,22 @@ createRoutes.post(
 
       if (cachedResult) {
         console.log("Returning cached plugin result");
+        
+        // Format response to match what the Node script expects
+        const pluginName = Object.keys(cachedResult).find(file => file.endsWith('.java'))?.split('/').pop()?.replace('.java', '') || 'Plugin';
+        
         res.status(200).json({
           status: "success",
+          success: true, // For compatibility with the Node script
           message: "Minecraft plugin generated successfully (cached)",
-          data: cachedResult
+          data: cachedResult,
+          pluginName: pluginName,
+          files: Object.keys(cachedResult)
         });
         return;
       }
+
+      const startTime = Date.now();
 
       // Configure models upfront for reuse
       const proModel = genAI.getGenerativeModel({
@@ -321,6 +340,11 @@ createRoutes.post(
       const pluginBlueprint = await blueprintResult.response.text();
       console.log("Parallel generation complete");
 
+      // Extract plugin name from blueprint for later use
+      const pluginNameMatch = pluginBlueprint.match(/Plugin name:?\s*([A-Za-z0-9_]+)/i) || 
+                             pluginBlueprint.match(/Name:?\s*([A-Za-z0-9_]+)\s*plugin/i);
+      const pluginName = pluginNameMatch ? pluginNameMatch[1] : "CustomPlugin";
+
       // PHASE 3: File List Extraction - use a more focused, concise prompt
       console.log("Extracting file list...");
       const fileListPrompt = `
@@ -347,7 +371,7 @@ createRoutes.post(
           fileStructure = fileStructure.map(path => {
             // Ensure Java files are in correct directory structure if not already
             if (path.endsWith(".java") && !path.includes("/")) {
-              return `src/main/java/com/pegasus/plugin/${path}`;
+              return `src/main/java/com/pegasus/${pluginName.toLowerCase()}/${path}`;
             }
             // Ensure resource files are in the right place
             if ((path === "plugin.yml" || path === "config.yml") && !path.includes("/")) {
@@ -360,10 +384,11 @@ createRoutes.post(
         }
       } catch (e) {
         console.warn("Error parsing file structure, using default structure", e);
+        // Create default structure using the extracted plugin name
         fileStructure = [
           "pom.xml",
           "src/main/resources/plugin.yml",
-          "src/main/java/com/pegasus/plugin/Main.java",
+          `src/main/java/com/pegasus/${pluginName.toLowerCase()}/Main.java`,
         ];
       }
 
@@ -379,15 +404,18 @@ createRoutes.post(
         BLUEPRINT:
         ${pluginBlueprint}
         
+        PLUGIN NAME: ${pluginName}
+        
         FILES TO CREATE:
         ${fileStructure.join("\n")}
         
         GUIDELINES:
-        - Always use "com.pegasus" as root package
+        - Always use "com.pegasus.${pluginName.toLowerCase()}" as root package
         - Follow blueprint class relationships exactly
         - No JetBrains annotations (@NotNull, @Nullable)
         - For pom.xml: Spigot 1.19.3 API, Java 11, Maven Shade Plugin 3.4.1
         - Ensure consistent package names across imports
+        - Make sure all classes compile without errors
         
         For EACH file use format:
         ---FILE_START:filepath---
@@ -447,11 +475,37 @@ createRoutes.post(
           if (!fileContent.startsWith("<?xml")) {
             fileContent = '<?xml version="1.0" encoding="UTF-8"?>\n' + fileContent;
           }
+          
+          // Make sure artifactId uses the plugin name
+          if (!fileContent.includes(`<artifactId>${pluginName.toLowerCase()}</artifactId>`)) {
+            fileContent = fileContent.replace(
+              /<artifactId>(.*?)<\/artifactId>/,
+              `<artifactId>${pluginName.toLowerCase()}</artifactId>`
+            );
+          }
+        } else if (filePath.endsWith("plugin.yml")) {
+          // Ensure plugin.yml has the correct name
+          if (!fileContent.includes(`name: ${pluginName}`)) {
+            fileContent = fileContent.replace(/name: .*/, `name: ${pluginName}`);
+            if (!fileContent.includes("name:")) {
+              fileContent = `name: ${pluginName}\n${fileContent}`;
+            }
+          }
+          
+          // Ensure main class path is correct
+          const mainClassRegex = /main: .*?\n/;
+          const correctMainClass = `main: com.pegasus.${pluginName.toLowerCase()}.Main`;
+          if (fileContent.match(mainClassRegex)) {
+            fileContent = fileContent.replace(mainClassRegex, `main: com.pegasus.${pluginName.toLowerCase()}.Main\n`);
+          } else if (!fileContent.includes("main:")) {
+            fileContent += `\nmain: com.pegasus.${pluginName.toLowerCase()}.Main`;
+          }
         }
 
-        // Replace any yourusername with pegasus
+        // Replace any yourusername with pegasus and ensure package names match plugin name
         fileContent = fileContent
-          .replace(/com\.yourusername/g, "com.pegasus")
+          .replace(/com\.yourusername/g, `com.pegasus.${pluginName.toLowerCase()}`)
+          .replace(/com\.pegasus\.plugin/g, `com.pegasus.${pluginName.toLowerCase()}`)
           .replace(/yourusername/g, "pegasus");
 
         files[filePath] = fileContent;
@@ -471,7 +525,11 @@ createRoutes.post(
             
             ${pluginBlueprint}
             
+            PLUGIN NAME: ${pluginName}
+            
             Generate ONLY this file: ${filePath}
+            
+            Use package: com.pegasus.${pluginName.toLowerCase()}
             
             Return the complete implementation of the file. NO explanations or markdown, JUST the file content.
           `;
@@ -618,7 +676,8 @@ createRoutes.post(
       for (const filePath in files) {
         // Batch replacements for efficiency
         files[filePath] = files[filePath]
-          .replace(/com\.yourusername/g, "com.pegasus")
+          .replace(/com\.yourusername/g, `com.pegasus.${pluginName.toLowerCase()}`)
+          .replace(/com\.pegasus\.plugin/g, `com.pegasus.${pluginName.toLowerCase()}`)
           .replace(/yourusername/g, "pegasus")
           .replace(/@NotNull |@Nullable /g, "");
           
@@ -635,19 +694,32 @@ createRoutes.post(
         }
       }
 
+      // Calculate approximate JAR path for response (this is what the bash script would create)
+      const jarPath = `target/${pluginName.toLowerCase()}-1.0-SNAPSHOT.jar`;
+      const processingTime = ((Date.now() - startTime) / 1000).toFixed(2);
+
       // Cache the result
       pluginCache.set(cacheKey, files);
 
-      // Send the generated files as response
+      // Send the generated files as response in a format compatible with the Node script
       res.status(200).json({
         status: "success",
+        success: true, // For compatibility with the Node script
         message: "Minecraft plugin generated successfully",
         data: files,
+        files: Object.keys(files),
+        pluginName: pluginName,
+        jarPath: jarPath,
+        processingTime: `${processingTime}s`,
+        // The following fields are included for compatibility with your Node.js script
+        outputDir: "", // This will be set by the node script
+        log: `Processed plugin generation in ${processingTime} seconds. Generated ${Object.keys(files).length} files.`,
       });
     } catch (error) {
       console.error("Error generating Minecraft plugin:", error);
       res.status(500).json({
         status: "error",
+        success: false, // For compatibility with the Node script
         message: "Failed to generate Minecraft plugin",
         error: (error as Error).message,
       });
