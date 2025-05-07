@@ -30,3 +30,5 @@ Thumbs.db
 *.sublime-*
 *.swp
 *.swo
+
+wsl.js

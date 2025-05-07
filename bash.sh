@@ -12,24 +12,22 @@ trap cleanup EXIT INT TERM
 # Print PATH for debugging
 echo "Current PATH: $PATH"
 
-# Check if curl is installed
-if ! command -v curl &> /dev/null; then
-    echo "Error: curl is required but not installed. Please install curl first."
-    echo "You can install it with: sudo apt-get install curl"
-    exit 1
-fi
+# Check for required dependencies
+REQUIRED_TOOLS=("curl" "jq" "mvn")
+MISSING_TOOLS=()
 
-# Check if jq is installed (required for JSON parsing)
-if ! command -v jq &> /dev/null; then
-    echo "Error: jq is required but not installed. Please install jq first."
-    echo "You can install it with: sudo apt-get install jq"
-    exit 1
-fi
+for tool in "${REQUIRED_TOOLS[@]}"; do
+    if ! command -v "$tool" &> /dev/null; then
+        MISSING_TOOLS+=("$tool")
+    fi
+done
 
-# Check if Maven is installed
-if ! command -v mvn &> /dev/null; then
-    echo "Error: Maven is required but not installed. Please install Maven first."
-    echo "You can install it with: sudo apt-get install maven"
+if [ ${#MISSING_TOOLS[@]} -ne 0 ]; then
+    echo "❌ Error: The following required tools are missing:"
+    for tool in "${MISSING_TOOLS[@]}"; do
+        echo "  - $tool"
+    done
+    echo "Please install them before continuing."
     exit 1
 fi
 
@@ -42,7 +40,7 @@ fi
 
 # Define API endpoints - use configurable host
 # Default to Docker bridge network gateway for container-to-container communication
-API_HOST="${API_HOST:-http://172.17.0.1:5000}"
+API_HOST="${API_HOST:-http://host.docker.internal:5000}"
 API_URL="${API_HOST}/api/create"
 API_URL_FIX="${API_HOST}/api/fix"
 
@@ -69,12 +67,18 @@ TOKEN="$2"
 BASE_OUTPUT_DIR="${3:-.}"  # Default to current directory if not provided
 
 # Make the realpath command cross-platform compatible
-if command -v realpath &> /dev/null; then
-    BASE_OUTPUT_DIR="$(realpath -m "$BASE_OUTPUT_DIR")"
-else
-    # Fallback for Windows systems without realpath
-    BASE_OUTPUT_DIR="$(cd "$BASE_OUTPUT_DIR" 2>/dev/null || mkdir -p "$BASE_OUTPUT_DIR" && cd "$BASE_OUTPUT_DIR" && pwd)"
-fi
+find_command() {
+    if command -v "$1" &> /dev/null; then
+        eval "$2"
+    else
+        eval "$3"
+    fi
+}
+
+find_command "realpath" \
+    "BASE_OUTPUT_DIR=\"\$(realpath -m \"$BASE_OUTPUT_DIR\")\"" \
+    "BASE_OUTPUT_DIR=\"\$(cd \"$BASE_OUTPUT_DIR\" 2>/dev/null || mkdir -p \"$BASE_OUTPUT_DIR\" && cd \"$BASE_OUTPUT_DIR\" && pwd)\""
+
 mkdir -p "$BASE_OUTPUT_DIR"
 
 # Generate plugin folder name from prompt
@@ -99,285 +103,322 @@ RESPONSE=$(curl -s --connect-timeout 30 --max-time 600 -X POST "$API_URL" \
     -H "Authorization: Bearer $TOKEN" \
     -d "{\"prompt\": $(jq -R -s . <<< "$PROMPT")}" 2>/dev/null)
 
-# Validate API response
-if [ -z "$RESPONSE" ]; then
-    echo "❌ Error: Empty response from API. Check your network connection and Docker setup."
-    echo "ℹ️ If this keeps failing, try one of these options:"
-    echo "   1. Edit $CONFIG_FILE and set API_HOST=http://localhost:5000"
-    echo "   2. Or try: API_HOST=http://host.docker.internal:5000 $0 \"$PROMPT\" $TOKEN"
-    echo "   3. Or try: API_HOST=http://api:5000 $0 \"$PROMPT\" $TOKEN (if using Docker Compose)"
+# Validate API response function
+validate_response() {
+    local response="$1"
+    local purpose="$2"
+    
+    # Check for empty response
+    if [ -z "$response" ]; then
+        echo "❌ Error: Empty response from $purpose API. Check your network connection."
+        if [ "$purpose" = "plugin generation" ]; then
+            echo "ℹ️ If this keeps failing, try one of these options:"
+            echo "   1. Edit $CONFIG_FILE and set API_HOST=http://localhost:5000"
+            echo "   2. Or try: API_HOST=http://host.docker.internal:5000 $0 \"$PROMPT\" $TOKEN"
+            echo "   3. Or try: API_HOST=http://api:5000 $0 \"$PROMPT\" $TOKEN (if using Docker Compose)"
+        fi
+        return 1
+    fi
+    
+    # Check for valid JSON
+    if ! echo "$response" | jq -e '.' &>/dev/null; then
+        echo "❌ Error: Invalid JSON response from $purpose API."
+        echo "Raw response: $response"
+        return 1
+    fi
+    
+    # Check for success status
+    if ! echo "$response" | jq -e '.status == "success"' > /dev/null; then
+        ERROR_MSG=$(echo "$response" | jq -r '.message // "Unknown error"')
+        echo "❌ Error from $purpose API: $ERROR_MSG"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Validate and process the response
+if ! validate_response "$RESPONSE" "plugin generation"; then
+    echo "Full response: $RESPONSE"
     exit 1
 fi
 
-if ! echo "$RESPONSE" | jq -e '.' &>/dev/null; then
-    echo "❌ Error: Invalid JSON response from API."
-    echo "Raw response: $RESPONSE"
-    exit 1
-fi
+echo "✅ Plugin generated successfully!"
 
-# Check if the API request was successful
-if echo "$RESPONSE" | jq -e '.status == "success"' > /dev/null; then
-    echo "✅ Plugin generated successfully!"
+# Extract the data field containing files and create directories more efficiently
+FILES=$(echo "$RESPONSE" | jq '.data')
+DIRS_CREATED=()
+
+for FILE_PATH in $(echo "$FILES" | jq -r 'keys[]'); do
+    # Extract directory path
+    DIR_PATH=$(dirname "$OUTPUT_DIR/$FILE_PATH")
     
-    # Extract the data field containing files
-    FILES=$(echo "$RESPONSE" | jq '.data')
+    # Create directory only if not already created
+    if [[ ! " ${DIRS_CREATED[@]} " =~ " ${DIR_PATH} " ]]; then
+        mkdir -p "$DIR_PATH"
+        DIRS_CREATED+=("$DIR_PATH")
+    fi
     
-    # Process each file path separately using jq
-    for FILE_PATH in $(echo "$FILES" | jq -r 'keys[]'); do
-        # Get the file content using jq
-        FILE_CONTENT=$(echo "$FILES" | jq -r --arg path "$FILE_PATH" '.[$path]')
+    # Write content directly to file
+    echo "$FILES" | jq -r --arg path "$FILE_PATH" '.[$path]' > "$OUTPUT_DIR/$FILE_PATH"
+    echo "📄 Created: $FILE_PATH"
+done
+
+echo "🎉 Plugin files have been successfully created in $OUTPUT_DIR"
+
+# Validate main class consistency
+validate_main_class() {
+    local plugin_yml="$OUTPUT_DIR/src/main/resources/plugin.yml"
+    if [ -f "$plugin_yml" ]; then
+        local main_class=$(grep "main:" "$plugin_yml" | cut -d ":" -f2 | tr -d ' ')
         
-        # Create the full path
-        FULL_PATH="$OUTPUT_DIR/$FILE_PATH"
+        # Convert package name to path format
+        local package_path=$(echo "$main_class" | sed 's/\./\//g')
+        local class_name=$(echo "$main_class" | awk -F. '{print $NF}')
+        local expected_file="$OUTPUT_DIR/src/main/java/${package_path}.java"
         
-        # Create directory structure if it doesn't exist
-        mkdir -p "$(dirname "$FULL_PATH")"
-        
-        # Write content to file properly, handling special characters
-        printf "%s" "$FILE_CONTENT" > "$FULL_PATH"
-        
-        echo "📄 Created: $FILE_PATH"
-    done
+        # Check if the Java file for the main class exists
+        if [ ! -f "$expected_file" ]; then
+            echo "⚠️ Warning: Main class $main_class specified in plugin.yml doesn't match any Java file."
+            
+            # Find the actual JavaPlugin implementation
+            find_command "find" \
+                "ACTUAL_FILES=\$(find \"$OUTPUT_DIR/src/main/java\" -name \"*.java\" -type f)" \
+                "ACTUAL_FILES=\$(dir /s /b \"$OUTPUT_DIR\\src\\main\\java\\*.java\" | tr '\\\\' '/')"
+                
+            for file in $ACTUAL_FILES; do
+                if grep -q "public class .* extends JavaPlugin" "$file"; then
+                    # Extract package and class name
+                    local actual_package=$(grep -o "package .*;" "$file" | sed 's/package //' | sed 's/;//')
+                    local actual_class_name=$(grep -o "public class .* extends JavaPlugin" "$file" | awk '{print $3}')
+                    local actual_full_class="$actual_package.$actual_class_name"
+                    
+                    echo "🔧 Fixing: Updating main class in plugin.yml to $actual_full_class"
+                    sed -i "s/main: .*/main: $actual_full_class/" "$plugin_yml"
+                    break
+                fi
+            done
+        fi
+    fi
+}
+
+# Check if main class in plugin.yml matches Java file
+validate_main_class
+
+# Check if pom.xml exists and build with Maven
+if [ -f "$OUTPUT_DIR/pom.xml" ]; then
+    echo "----------------------------------------"
+    echo "🔨 Building plugin with Maven..."
+    echo "----------------------------------------"
     
-    echo "🎉 Plugin files have been successfully created in $OUTPUT_DIR"
+    # Save current directory to return later
+    CURRENT_DIR=$(pwd)
     
-    # Check if pom.xml exists and build with Maven
-    if [ -f "$OUTPUT_DIR/pom.xml" ]; then
-        echo "----------------------------------------"
-        echo "🔨 Building plugin with Maven..."
-        echo "----------------------------------------"
-        
-        # Save current directory to return later
-        CURRENT_DIR=$(pwd)
-        
-        # Change to the plugin directory
-        cd "$OUTPUT_DIR"
-        
-        # Clean any previous build artifacts first
+    # Change to the plugin directory
+    cd "$OUTPUT_DIR"
+    
+    # More efficient Maven build process
+    build_plugin() {
         echo "🧹 Cleaning previous build artifacts..."
         rm -rf target/
         
-        # Build with Maven
         echo "🏗️ Running Maven build..."
-        if mvn clean package; then
-            echo "----------------------------------------"
-            echo "✅ Maven build successful!"
-            echo "----------------------------------------"
-            
-            # Find the generated JAR file
-            if command -v find &> /dev/null; then
-                JAR_FILE=$(find target -name "*.jar" | grep -v "original" | head -n 1)
-            else
-                # Fallback for Windows
-                JAR_FILE=$(dir /s /b target\*.jar | findstr /v "original" | head -n 1)
-            fi
-            
-            if [ -n "$JAR_FILE" ]; then
-                echo "🎮 Plugin JAR file created: $JAR_FILE"
-                echo "To use the plugin, copy this JAR file to your Minecraft server's plugins folder."
-            else
-                echo "⚠️ Plugin JAR file not found in target directory."
-            fi
+        if mvn clean package -B; then
+            return 0
         else
+            return 1
+        fi
+    }
+    
+    # Find the JAR file more efficiently
+    find_jar_file() {
+        find_command "find" \
+            "JAR_FILE=\$(find target -name \"*.jar\" | grep -v \"original\" | head -n 1)" \
+            "JAR_FILE=\$(dir /s /b target\\*.jar | findstr /v \"original\" | head -n 1 | tr '\\\\' '/')"
+        echo "$JAR_FILE"
+    }
+    
+    # Collect file contents for AI fix more efficiently
+    collect_file_contents() {
+        local first=true
+        local file_data=""
+        
+        find_command "find" \
+            "FILE_LIST=\$(find . -type f \\( -name \"*.java\" -o -name \"pom.xml\" -o -name \"plugin.yml\" -o -name \"config.yml\" \\) 2>/dev/null)" \
+            "FILE_LIST=\$(dir /s /b *.java *.xml *.yml | findstr /v /i target)"
+        
+        for file in $FILE_LIST; do
+            # Skip target directory files
+            [[ "$file" == *"target/"* ]] && continue
+            
+            if [ "$first" = true ]; then
+                first=false
+            else
+                file_data+=","
+            fi
+            
+            # Get relative path
+            find_command "realpath" \
+                "REL_PATH=\$(realpath --relative-to=\".\" \"$file\")" \
+                "REL_PATH=\"$file\""
+            
+            file_data+="\"$REL_PATH\": $(jq -Rs . < "$file")"
+        done
+        
+        echo "$file_data"
+    }
+    
+    # Try to build the plugin
+    if build_plugin; then
+        echo "----------------------------------------"
+        echo "✅ Maven build successful!"
+        echo "----------------------------------------"
+        
+        # Find the generated JAR file
+        JAR_FILE=$(find_jar_file)
+        
+        if [ -n "$JAR_FILE" ]; then
+            echo "🎮 Plugin JAR file created: $JAR_FILE"
+            echo "To use the plugin, copy this JAR file to your Minecraft server's plugins folder."
+            # Add standardized output for the server to parse
+            echo "PLUGIN_JAR_PATH:$JAR_FILE"
+        else
+            echo "⚠️ Plugin JAR file not found in target directory."
+        fi
+    else
+        echo "----------------------------------------"
+        echo "❌ Maven build failed. Attempting to fix issues with AI..."
+        echo "----------------------------------------"
+        
+        # Initialize attempt counter
+        AI_FIX_ATTEMPTS=0
+        MAX_AI_FIX_ATTEMPTS=50
+        BUILD_SUCCESS=false
+        
+        # Start AI fix loop
+        while [ $AI_FIX_ATTEMPTS -lt $MAX_AI_FIX_ATTEMPTS ] && [ "$BUILD_SUCCESS" = false ]; do
+            AI_FIX_ATTEMPTS=$((AI_FIX_ATTEMPTS + 1))
             echo "----------------------------------------"
-            echo "❌ Maven build failed. Attempting to fix issues with AI..."
+            echo "🔄 AI Fix Attempt #$AI_FIX_ATTEMPTS of $MAX_AI_FIX_ATTEMPTS"
             echo "----------------------------------------"
             
-            # Initialize attempt counter
-            AI_FIX_ATTEMPTS=0
-            MAX_AI_FIX_ATTEMPTS=50
-            BUILD_SUCCESS=false
+            # Capture the build errors
+            BUILD_ERRORS=$(mvn clean compile -e 2>&1)
             
-            # Start AI fix loop
-            while [ $AI_FIX_ATTEMPTS -lt $MAX_AI_FIX_ATTEMPTS ] && [ "$BUILD_SUCCESS" = false ]; do
-                AI_FIX_ATTEMPTS=$((AI_FIX_ATTEMPTS + 1))
-                echo "----------------------------------------"
-                echo "🔄 AI Fix Attempt #$AI_FIX_ATTEMPTS of $MAX_AI_FIX_ATTEMPTS"
-                echo "----------------------------------------"
-                
-                # Capture the build errors
-                BUILD_ERRORS=$(mvn clean compile -e 2>&1)
-                
-                echo "🔍 Analyzing build errors..."
-                
-                # Prepare the JSON payload with errors and file contents
-                TEMP_JSON_FILE=$(mktemp)
-                echo "{" > "$TEMP_JSON_FILE"
-                echo "  \"buildErrors\": $(jq -Rs . <<< "$BUILD_ERRORS")," >> "$TEMP_JSON_FILE"
-                echo "  \"files\": {" >> "$TEMP_JSON_FILE"
-                
-                # Add all Java and resource files to the JSON
-                FIRST_FILE=true
-                
-                # Create a cross-platform find command
-                if command -v find &> /dev/null; then
-                    find_command="find . -type f -name \"*.java\" -o -name \"pom.xml\" -o -name \"plugin.yml\" -o -name \"config.yml\""
-                else
-                    # Fallback for Windows without proper find command
-                    find_command="dir /s /b *.java *.xml *.yml | findstr /v /i target"
-                fi
-                
-                for FILE_PATH in $(eval $find_command); do
-                    # Skip target directory files
-                    if [[ "$FILE_PATH" == *"target/"* ]]; then
-                        continue
-                    fi
-                    
-                    # Get relative path to the output directory
-                    if command -v realpath &> /dev/null; then
-                        REL_PATH=$(realpath --relative-to="." "$FILE_PATH")
-                    else
-                        # Simple basename for Windows
-                        REL_PATH="$FILE_PATH"
-                    fi
-                    
-                    if [ "$FIRST_FILE" = true ]; then
-                        FIRST_FILE=false
-                    else
-                        echo "," >> "$TEMP_JSON_FILE"
-                    fi
-                    
-                    # Add the file content to the JSON
-                    echo "    \"$REL_PATH\": $(jq -Rs . < "$FILE_PATH")" >> "$TEMP_JSON_FILE"
-                done
-                
-                echo "  }" >> "$TEMP_JSON_FILE"
-                echo "}" >> "$TEMP_JSON_FILE"
-                
-                echo "🔄 Sending build errors to API for fixing (this may take a few minutes)..."
-                
-                # Make API request to fix issues
-                FIX_RESPONSE=$(curl -s --connect-timeout 30 --max-time 600 -X POST "$API_URL_FIX" \
-                    -H "Content-Type: application/json" \
-                    -H "Authorization: Bearer $TOKEN" \
-                    -d @"$TEMP_JSON_FILE")
-                
-                # Validate fix API response
-                if [ -z "$FIX_RESPONSE" ]; then
-                    echo "❌ Error: Empty response from fix API. Check your network connection."
-                    break
-                fi
-                
-                if ! echo "$FIX_RESPONSE" | jq -e '.' &>/dev/null; then
-                    echo "❌ Error: Invalid JSON response from fix API."
-                    echo "Raw response: $FIX_RESPONSE"
-                    break
-                fi
-                
-                # Check if the fix API request was successful
-                if echo "$FIX_RESPONSE" | jq -e '.status == "success"' > /dev/null; then
-                    echo "✅ Received fixes from API!"
-                    
-                    # Extract the fixed files
-                    FIXED_FILES=$(echo "$FIX_RESPONSE" | jq '.data')
-                    
-                    # Process each fixed file
-                    for FILE_PATH in $(echo "$FIXED_FILES" | jq -r 'keys[]'); do
-                        # Get the file content using jq
-                        FILE_CONTENT=$(echo "$FIXED_FILES" | jq -r --arg path "$FILE_PATH" '.[$path]')
-                        
-                        # Create directory structure if it doesn't exist (for new files)
-                        mkdir -p "$(dirname "$FILE_PATH")"
-                        
-                        # Write the fixed content to the file
-                        printf "%s" "$FILE_CONTENT" > "$FILE_PATH"
-                        
-                        echo "🔧 Updated: $FILE_PATH"
-                    done
-                    
-                    echo "----------------------------------------"
-                    echo "🔄 Retrying build with fixed files..."
-                    echo "----------------------------------------"
-                    
-                    # Try to build again with the fixed files
-                    if mvn clean package; then
-                        echo "----------------------------------------"
-                        echo "✅ Build successful after $AI_FIX_ATTEMPTS AI fix attempts!"
-                        echo "----------------------------------------"
-                        
-                        # Find the generated JAR file
-                        if command -v find &> /dev/null; then
-                            JAR_FILE=$(find target -name "*.jar" | grep -v "original" | head -n 1)
-                        else
-                            # Fallback for Windows
-                            JAR_FILE=$(dir /s /b target\*.jar | findstr /v "original" | head -n 1)
-                        fi
-                        
-                        if [ -n "$JAR_FILE" ]; then
-                            echo "🎮 Plugin JAR file created: $JAR_FILE"
-                            echo "To use the plugin, copy this JAR file to your Minecraft server's plugins folder."
-                        else
-                            echo "⚠️ Plugin JAR file not found in target directory."
-                        fi
-                        
-                        BUILD_SUCCESS=true
-                        break
-                    else
-                        echo "❌ Build still failing after fix attempt #$AI_FIX_ATTEMPTS"
-                        if [ $AI_FIX_ATTEMPTS -ge $MAX_AI_FIX_ATTEMPTS ]; then
-                            echo "Maximum fix attempts reached."
-                        else
-                            echo "Continuing with next fix attempt..."
-                        fi
-                    fi
-                else
-                    # Display error message if the fix API failed
-                    ERROR_MSG=$(echo "$FIX_RESPONSE" | jq -r '.message // "Unknown error"')
-                    echo "❌ Error from fix API: $ERROR_MSG"
-                    echo "Continuing with next fix attempt..."
-                fi
-                
-                # Clean up temp file for this attempt
+            echo "🔍 Analyzing build errors..."
+            
+            # Prepare the JSON payload with errors and file contents
+            TEMP_JSON_FILE=$(mktemp)
+            echo "{" > "$TEMP_JSON_FILE"
+            echo "  \"buildErrors\": $(jq -Rs . <<< "$BUILD_ERRORS")," >> "$TEMP_JSON_FILE"
+            echo "  \"files\": {" >> "$TEMP_JSON_FILE"
+            collect_file_contents >> "$TEMP_JSON_FILE"
+            echo "  }" >> "$TEMP_JSON_FILE"
+            echo "}" >> "$TEMP_JSON_FILE"
+            
+            echo "🔄 Sending build errors to API for fixing (this may take a few minutes)..."
+            
+            # Make API request to fix issues
+            FIX_RESPONSE=$(curl -s --connect-timeout 30 --max-time 600 -X POST "$API_URL_FIX" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $TOKEN" \
+                -d @"$TEMP_JSON_FILE")
+            
+            # Validate fix API response
+            if ! validate_response "$FIX_RESPONSE" "fix"; then
+                echo "Continuing with next fix attempt..."
                 rm -f "$TEMP_JSON_FILE"
+                continue
+            fi
+            
+            echo "✅ Received fixes from API!"
+            
+            # Extract the fixed files
+            FIXED_FILES=$(echo "$FIX_RESPONSE" | jq '.data')
+            
+            # Process each fixed file
+            for FILE_PATH in $(echo "$FIXED_FILES" | jq -r 'keys[]'); do
+                # Write content directly to file
+                echo "$FIXED_FILES" | jq -r --arg path "$FILE_PATH" '.[$path]' > "$FILE_PATH"
+                echo "🔧 Updated: $FILE_PATH"
             done
             
-            # If all AI fix attempts failed, try manual approach
-            if [ "$BUILD_SUCCESS" = false ]; then
+            echo "----------------------------------------"
+            echo "🔄 Retrying build with fixed files..."
+            echo "----------------------------------------"
+            
+            # Try to build again with the fixed files
+            if build_plugin; then
                 echo "----------------------------------------"
-                echo "❌ AI-based fixes unsuccessful after $MAX_AI_FIX_ATTEMPTS attempts."
-                echo "🔧 Attempting manual fixes..."
+                echo "✅ Build successful after $AI_FIX_ATTEMPTS AI fix attempts!"
                 echo "----------------------------------------"
                 
-                # Try with skip shade option as a fallback
-                echo "Attempting build with -Dmaven.shade.skip=true..."
-                if mvn clean package -Dmaven.shade.skip=true; then
-                    echo "⚠️ Basic build succeeded without shading."
-                    
-                    if command -v find &> /dev/null; then
-                        JAR_FILE=$(find target -name "*.jar" | head -n 1)
-                    else
-                        # Windows fallback
-                        JAR_FILE=$(dir /s /b target\*.jar | head -n 1)
-                    fi
-                    
-                    if [ -n "$JAR_FILE" ]; then
-                        echo "🎮 Plugin JAR file created (without shading): $JAR_FILE"
-                        echo "Note: This JAR may not include all dependencies."
-                    fi
+                # Find the generated JAR file
+                JAR_FILE=$(find_jar_file)
+                
+                if [ -n "$JAR_FILE" ]; then
+                    echo "🎮 Plugin JAR file created: $JAR_FILE"
+                    echo "To use the plugin, copy this JAR file to your Minecraft server's plugins folder."
+                    # Add standardized output for the server to parse
+                    echo "PLUGIN_JAR_PATH:$JAR_FILE"
                 else
-                    echo "----------------------------------------"
-                    echo "❌ Maven build failed with all approaches."
-                    echo "Common issues to check:"
-                    echo "1. Incorrect plugin dependencies"
-                    echo "2. Maven Shade Plugin configuration issues"
-                    echo "3. Java version compatibility problems"
-                    echo "4. File permission issues in the target directory"
-                    echo "----------------------------------------"
+                    echo "⚠️ Plugin JAR file not found in target directory."
+                fi
+                
+                BUILD_SUCCESS=true
+                break
+            else
+                echo "❌ Build still failing after fix attempt #$AI_FIX_ATTEMPTS"
+                if [ $AI_FIX_ATTEMPTS -ge $MAX_AI_FIX_ATTEMPTS ]; then
+                    echo "Maximum fix attempts reached."
+                else
+                    echo "Continuing with next fix attempt..."
                 fi
             fi
-        fi
+            
+            # Clean up temp file for this attempt
+            rm -f "$TEMP_JSON_FILE"
+        done
         
-        # Return to original directory
-        cd "$CURRENT_DIR"
-    else
-        echo "⚠️ No pom.xml found in $OUTPUT_DIR. Maven build skipped."
+        # If all AI fix attempts failed, try manual approach
+        if [ "$BUILD_SUCCESS" = false ]; then
+            echo "----------------------------------------"
+            echo "❌ AI-based fixes unsuccessful after $MAX_AI_FIX_ATTEMPTS attempts."
+            echo "🔧 Attempting manual fixes..."
+            echo "----------------------------------------"
+            
+            # Try with skip shade option as a fallback
+            echo "Attempting build with -Dmaven.shade.skip=true..."
+            if mvn clean package -Dmaven.shade.skip=true; then
+                echo "⚠️ Basic build succeeded without shading."
+                
+                find_command "find" \
+                    "JAR_FILE=\$(find target -name \"*.jar\" | head -n 1)" \
+                    "JAR_FILE=\$(dir /s /b target\\*.jar | head -n 1 | tr '\\\\' '/')"
+                
+                if [ -n "$JAR_FILE" ]; then
+                    echo "🎮 Plugin JAR file created (without shading): $JAR_FILE"
+                    echo "Note: This JAR may not include all dependencies."
+                    # Add standardized output for the server to parse
+                    echo "PLUGIN_JAR_PATH:$JAR_FILE"
+                fi
+            else
+                echo "----------------------------------------"
+                echo "❌ Maven build failed with all approaches."
+                echo "Common issues to check:"
+                echo "1. Incorrect plugin dependencies"
+                echo "2. Maven Shade Plugin configuration issues"
+                echo "3. Java version compatibility problems"
+                echo "4. File permission issues in the target directory"
+                echo "----------------------------------------"
+            fi
+        fi
     fi
+    
+    # Return to original directory
+    cd "$CURRENT_DIR"
 else
-    # Display error message and full response for debugging
-    ERROR_MSG=$(echo "$RESPONSE" | jq -r '.message // "Unknown error"')
-    echo "❌ Error: $ERROR_MSG"
-    echo "Full response: $RESPONSE"
-    exit 1
+    echo "⚠️ No pom.xml found in $OUTPUT_DIR. Maven build skipped."
 fi
 
 echo "----------------------------------------"

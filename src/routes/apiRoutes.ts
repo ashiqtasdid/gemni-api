@@ -7,14 +7,38 @@ import NodeCache from "node-cache";
 import path from "path";
 
 dotenv.config();
+
 // Initialize the Gemini API client
 const API_KEY = process.env.GEMINI_API_KEY || "";
 const genAI = new GoogleGenerativeAI(API_KEY);
 
-// Initialize cache with 1 hour TTL
-const pluginCache = new NodeCache({ stdTTL: 3600 });
+// Initialize cache with configurable TTL (default: 1 hour)
+const CACHE_TTL = parseInt(process.env.CACHE_TTL || "3600");
+const pluginCache = new NodeCache({ stdTTL: CACHE_TTL });
 
-// Add these interfaces near the top of your file, after your imports
+// Precompile frequently used regex patterns for better performance
+const FILE_PATTERN = /---FILE_START:(.*?)---([\s\S]*?)---FILE_END---/g;
+const PLUGIN_NAME_PATTERN = /Plugin name:?\s*([A-Za-z0-9_]+)/i;
+const PLUGIN_NAME_ALT_PATTERN = /Name:?\s*([A-Za-z0-9_]+)\s*plugin/i;
+const JSON_ARRAY_PATTERN = /\[\s*"[^"]+(?:",\s*"[^"]+")*\s*\]/;
+const FILE_EXTENSION_PATTERN = /[\w\/\-\.]+\.(java|xml|yml)/g;
+const MARKDOWN_CODE_PATTERN = /^```(?:java|xml|yml|yaml)?\s*\n?|```\s*$|```/g;
+
+// Model configuration templates
+const MODEL_CONFIG = {
+  flash: {
+    name: "gemini-2.5-flash-preview-04-17",
+    precision: { temperature: 0.1, topP: 0.95, topK: 64 },
+    creative: { temperature: 0.5, topP: 0.95, topK: 64 }
+  },
+  pro: {
+    name: "gemini-2.5-pro-preview-03-25",
+    precision: { temperature: 0.1, topP: 0.95, topK: 64 },
+    creative: { temperature: 0.2, topP: 0.95, topK: 64 }
+  }
+};
+
+// Interfaces
 interface InconsistencyIssue {
   fileA: string;
   fileB: string;
@@ -27,25 +51,73 @@ interface InconsistencyResponse {
   issues?: InconsistencyIssue[];
 }
 
-// Create separate routers for each feature
+// Create separate routers
 const fixRoutes: Router = express.Router();
 const createRoutes: Router = express.Router();
 
-// Fix routes - enhanced to handle build failures
+// Helper functions for code reuse and optimized processing
+const getModel = (modelConfig: any, config: any) => {
+  return genAI.getGenerativeModel({
+    model: modelConfig.name,
+    generationConfig: config
+  });
+};
+
+const cleanContent = (content: string): string => {
+  return content.replace(MARKDOWN_CODE_PATTERN, "");
+};
+
+const hashString = (input: string): string => {
+  return crypto.createHash('md5').update(input).digest('hex');
+};
+
+// Process Java file content with optimized batch replacements
+const processJavaFile = (filePath: string, content: string, pluginName: string): string => {
+  // Handle package declaration
+  const packageMatch = filePath.match(/src\/main\/java\/(.*\/)/);
+  const packageName = packageMatch ? packageMatch[1].replace(/\//g, ".").replace(/\.$/, "") : "";
+
+  // Apply all transformations in one pass for efficiency
+  let result = content
+    // Fix invalid API calls
+    .replace(/pig\.setAngry\(([^)]+)\)/g, 
+      '// Pig.setAngry() doesn\'t exist in Bukkit API \n    pig.setPersistent(true);\n    pig.setCustomName("Angry Pig");\n    pig.setMetadata("angry", new FixedMetadataValue(plugin, true));')
+    // Remove JetBrains annotations
+    .replace(/import org\.jetbrains\.annotations\.[^;]*;(\r?\n|\r)?/g, "")
+    .replace(/@NotNull |@Nullable /g, "")
+    // Fix package names
+    .replace(/com\.yourusername/g, `com.pegasus.${pluginName.toLowerCase()}`)
+    .replace(/com\.pegasus\.plugin/g, `com.pegasus.${pluginName.toLowerCase()}`)
+    .replace(/yourusername/g, "pegasus");
+
+  // Add metadata import if needed
+  if (result.includes("setMetadata") && !result.includes("import org.bukkit.metadata.FixedMetadataValue")) {
+    const importSection = result.match(/(import .+;\n\n)/);
+    if (importSection) {
+      result = result.replace(importSection[0], importSection[0] + "import org.bukkit.metadata.FixedMetadataValue;\n");
+    }
+  }
+
+  // Fix package if needed
+  if (packageName && !result.trim().startsWith("package")) {
+    result = `package ${packageName};\n\n${result}`;
+  }
+
+  return result;
+};
+
+// Fix routes - optimized for build error resolution
 fixRoutes.post(
   "/",
   verifyToken,
   async (req: Request, res: Response): Promise<void> => {
     try {
-      // Get JSON data from request body
-      const requestData = req.body;
-      console.log("Received build error fix request");
-
-      // Validate request body
-      if (!requestData || !requestData.buildErrors || !requestData.files) {
+      // Validate request
+      const { buildErrors, files } = req.body;
+      if (!buildErrors || !files) {
         res.status(400).json({
           status: "fail",
-          success: false, // For compatibility with the Node script
+          success: false,
           message: "Request must contain buildErrors and files fields",
         });
         return;
@@ -53,70 +125,43 @@ fixRoutes.post(
 
       console.log("Received build errors for fixing");
 
-      // Check cache for identical build errors
-      const cacheKey = crypto.createHash('md5').update(
-        requestData.buildErrors + Object.keys(requestData.files).join()
-      ).digest('hex');
-      
+      // Check cache with efficient hashing
+      const cacheKey = hashString(buildErrors + Object.keys(files).join());
       const cachedResult = pluginCache.get(cacheKey);
       if (cachedResult) {
         console.log("Returning cached fix result");
         res.status(200).json({
           status: "success",
-          success: true, // For compatibility with the Node script
+          success: true,
           message: "Files fixed successfully (cached)",
           data: cachedResult
         });
         return;
       }
 
-      // Configure the model - Use Flash model for faster response when appropriate
-      const flashModel = genAI.getGenerativeModel({
-        model: "gemini-2.5-flash-preview-04-17",
-        generationConfig: {
-          temperature: 0.1,
-          topP: 0.95,
-          topK: 64,
-        },
-      });
-
-      // For complex fixes, use Pro model
-      const proModel = genAI.getGenerativeModel({
-        model: "gemini-2.5-pro-preview-03-25",
-        generationConfig: {
-          temperature: 0.1,
-          topP: 0.95,
-          topK: 64,
-        },
-      });
-
-      // Extract build errors and files
-      const buildErrors = requestData.buildErrors;
-      const files = requestData.files;
-
-      // Select appropriate model based on complexity
+      // Model selection based on error complexity
       const isComplexError = buildErrors.length > 500 || Object.keys(files).length > 5;
-      const model = isComplexError ? proModel : flashModel;
+      const modelConfig = isComplexError ? MODEL_CONFIG.pro : MODEL_CONFIG.flash;
+      const model = getModel(modelConfig, modelConfig.precision);
 
-      // Optimize prompt by focusing only on files that might be relevant to the error
+      // Optimize file selection for analysis
       const relevantFiles: Record<string, string> = {};
       const errorMentionsFile = (error: string, fileName: string) => 
         error.includes(fileName) || error.toLowerCase().includes(fileName.toLowerCase());
       
       // First pass: include files directly mentioned in errors
-      for (const [path, content] of Object.entries(files)) {
+      Object.entries(files).forEach(([path, content]) => {
         const fileName = path.split('/').pop() || path;
         if (errorMentionsFile(buildErrors, fileName)) {
-          relevantFiles[path] = content as string;  // Use type assertion here
+          relevantFiles[path] = content as string;
         }
-      }
+      });
       
       // Second pass: if no directly mentioned files, include all
       if (Object.keys(relevantFiles).length === 0) {
-        // Use type-safe way to copy properties
-        for (const [path, content] of Object.entries(files)) {
+        Object.entries(files).forEach(([path, content]) => {
           relevantFiles[path] = content as string;
-        }
+        });
       }
       
       // Always include pom.xml if it exists
@@ -124,7 +169,11 @@ fixRoutes.post(
         relevantFiles["pom.xml"] = files["pom.xml"] as string;
       }
 
-      // Let the AI examine all files and errors at once
+      // Optimized prompt construction
+      const fileListSection = Object.entries(relevantFiles)
+        .map(([path, content]) => `FILE: ${path}\n${content}\n\n`)
+        .join("---\n");
+
       const fixPrompt = `
       You are a Minecraft plugin build error expert. A plugin build has failed with the following errors:
       
@@ -134,9 +183,7 @@ fixRoutes.post(
       Relevant project files are provided below. Analyze the build errors and fix ALL problematic files.
       Pay special attention to XML/POM parsing errors, which often indicate malformed XML.
       
-      ${Object.entries(relevantFiles)
-        .map(([path, content]) => `FILE: ${path}\n${content}\n\n`)
-        .join("---\n")}
+      ${fileListSection}
       
       Return ONLY the files that need fixing in this format:
       ---FILE_START:filepath---
@@ -155,24 +202,18 @@ fixRoutes.post(
       const fixedContent = await fixResult.response.text();
       console.log("Received fix response from Gemini API");
 
-      // Extract the fixed files from the response
+      // Extract fixed files efficiently
       const updatedFiles: Record<string, string> = {};
-      const filePattern = /---FILE_START:(.*?)---([\s\S]*?)---FILE_END---/g;
       let fileMatch;
-
-      while ((fileMatch = filePattern.exec(fixedContent)) !== null) {
+      
+      // Reset RegExp state for reuse
+      FILE_PATTERN.lastIndex = 0;
+      while ((fileMatch = FILE_PATTERN.exec(fixedContent)) !== null) {
         const filePath = fileMatch[1].trim();
-        let content = fileMatch[2].trim();
+        let content = cleanContent(fileMatch[2].trim());
 
-        // Efficient cleaning in one pass
-        content = content
-          .replace(/^```(?:java|xml|yml|yaml)?\s*\n?/i, "")
-          .replace(/\n?```\s*$/g, "")
-          .replace(/```/g, "");
-
-        // For Java files, check for common API errors
+        // Process Java files specially
         if (filePath.endsWith(".java")) {
-          // Batch all replacements
           content = content
             .replace(/pig\.setAngry\(([^)]+)\)/g, "// TODO: Pig.setAngry() doesn't exist in Bukkit API - implement custom behavior\n    // pig.setAngry($1)")
             .replace(/^package\s+(.+?)\s*;\s*```/gm, "package $1;")
@@ -186,10 +227,10 @@ fixRoutes.post(
       // Cache the result
       pluginCache.set(cacheKey, updatedFiles);
 
-      // Send the fixed files as the API response in a format compatible with the Node script
+      // Send response
       res.status(200).json({
         status: "success",
-        success: true, // For compatibility with the Node script
+        success: true,
         message: "Files fixed successfully",
         data: updatedFiles,
         changedFiles: Object.keys(updatedFiles).length
@@ -198,7 +239,7 @@ fixRoutes.post(
       console.error("Error fixing build issues:", error);
       res.status(500).json({
         status: "error",
-        success: false, // For compatibility with the Node script
+        success: false,
         message: "Failed to fix build issues",
         error: (error as Error).message,
       });
@@ -206,41 +247,34 @@ fixRoutes.post(
   }
 );
 
-// Create routes with Blueprint-based plugin generation
+// Create routes - optimized for plugin generation
 createRoutes.post(
   "/",
   verifyToken,
   async (req: Request, res: Response): Promise<void> => {
-    // Get JSON data from request body
-    const requestData = req.body;
-
-    // Log for debugging
-    console.log("Received plugin generation request");
-
-    // Validate request body contains prompt field
-    if (!requestData || !requestData.prompt) {
+    // Get and validate prompt
+    const { prompt } = req.body;
+    if (!prompt) {
       res.status(400).json({
         status: "fail",
-        success: false, // For compatibility with the Node script
+        success: false,
         message: "Request must contain a prompt field",
       });
       return;
     }
 
     try {
-      // Check cache for similar requests
-      const cacheKey = crypto.createHash('md5').update(requestData.prompt).digest('hex');
+      // Check cache
+      const cacheKey = hashString(prompt);
       const cachedResult = pluginCache.get(cacheKey);
 
       if (cachedResult) {
         console.log("Returning cached plugin result");
-        
-        // Format response to match what the Node script expects
         const pluginName = Object.keys(cachedResult).find(file => file.endsWith('.java'))?.split('/').pop()?.replace('.java', '') || 'Plugin';
         
         res.status(200).json({
           status: "success",
-          success: true, // For compatibility with the Node script
+          success: true,
           message: "Minecraft plugin generated successfully (cached)",
           data: cachedResult,
           pluginName: pluginName,
@@ -251,32 +285,15 @@ createRoutes.post(
 
       const startTime = Date.now();
 
-      // Configure models upfront for reuse
-      const proModel = genAI.getGenerativeModel({
-        model: "gemini-2.5-pro-preview-03-25",
-        generationConfig: {
-          temperature: 0.2,
-          topP: 0.95,
-          topK: 64,
-        },
-      });
+      // Get models using precompiled configurations
+      const proModel = getModel(MODEL_CONFIG.pro, MODEL_CONFIG.pro.creative);
+      const flashModel = getModel(MODEL_CONFIG.flash, MODEL_CONFIG.flash.creative);
 
-      const flashModel = genAI.getGenerativeModel({
-        model: "gemini-2.5-flash-preview-04-17",
-        generationConfig: {
-          temperature: 0.5,
-          topP: 0.95,
-          topK: 64,
-        },
-      });
-
-      // PHASE 1: Prepare prompts for parallel execution
-      console.log("Preparing prompts for parallel execution...");
-      
+      // Optimized prompts
       const refiningPrompt = `
         You are a Minecraft plugin requirements analyst. The user has provided this plugin request:
         
-        "${requestData.prompt}"
+        "${prompt}"
         
         Your task is to refine and expand this request into a clear, detailed specification for a Minecraft plugin.
         
@@ -294,7 +311,7 @@ createRoutes.post(
         You are a Minecraft plugin architect tasked with creating a complete, cohesive plugin blueprint.
         
         PLUGIN REQUIREMENTS:
-        ${requestData.prompt}
+        ${prompt}
         
         Your task is to create a COMPLETE PLUGIN BLUEPRINT that ensures all files work together consistently.
         
@@ -329,8 +346,8 @@ createRoutes.post(
         DO NOT INCLUDE FULL CODE IMPLEMENTATIONS YET, ONLY STRUCTURED SPECIFICATIONS.
       `;
 
-      // PHASE 1 & 2: Run requirements refinement and blueprint generation in parallel
-      console.log("Starting parallel blueprint and requirements refinement...");
+      // Run in parallel for speed
+      console.log("Starting parallel generation...");
       const [refinedPromptResult, blueprintResult] = await Promise.all([
         flashModel.generateContent(refiningPrompt),
         flashModel.generateContent(blueprintPrompt)
@@ -340,64 +357,107 @@ createRoutes.post(
       const pluginBlueprint = await blueprintResult.response.text();
       console.log("Parallel generation complete");
 
-      // Extract plugin name from blueprint for later use
-      const pluginNameMatch = pluginBlueprint.match(/Plugin name:?\s*([A-Za-z0-9_]+)/i) || 
-                             pluginBlueprint.match(/Name:?\s*([A-Za-z0-9_]+)\s*plugin/i);
+      // Extract plugin name with optimized regex matching
+      const pluginNameMatch = PLUGIN_NAME_PATTERN.exec(pluginBlueprint) || 
+                            PLUGIN_NAME_ALT_PATTERN.exec(pluginBlueprint);
       const pluginName = pluginNameMatch ? pluginNameMatch[1] : "CustomPlugin";
 
-      // PHASE 3: File List Extraction - use a more focused, concise prompt
+      // Get file list with optimized prompt
       console.log("Extracting file list...");
       const fileListPrompt = `
-        Based on this plugin blueprint, extract ONLY a JSON array of all files to create:
+        Based on this plugin blueprint, extract all files that need to be created.
         
-        ${pluginBlueprint.substring(0, 5000)}
+        BLUEPRINT EXCERPT:
+        ${pluginBlueprint.substring(0, 4000)}
         
-        Return ONLY a valid JSON array like this: ["pom.xml", "plugin.yml", "Main.java", ...].
-        Include pom.xml, plugin.yml, and all Java class files. Return ONLY the JSON array.
+        I need your response in a valid JSON array format ONLY, like this exact format:
+        ["pom.xml", "src/main/resources/plugin.yml", "src/main/java/com/pegasus/pluginname/Main.java"]
+        
+        Include all necessary files: pom.xml, plugin.yml, config.yml (if needed), and ALL Java class files.
+        Return ONLY the JSON array with no additional text, explanations, or formatting.
       `;
 
       const fileListResult = await flashModel.generateContent(fileListPrompt);
       const fileListText = await fileListResult.response.text();
 
-      // Extract JSON array from response with improved validation
+      // Extract file structure with optimized algorithm
       let fileStructure: string[] = [];
       try {
-        // Find anything that looks like a JSON array
-        const match = fileListText.match(/\[\s*"[^"]+(?:",\s*"[^"]+")*\s*\]/);
-        if (match) {
-          fileStructure = JSON.parse(match[0]);
+        // Try multiple extraction methods in order of reliability
+        let jsonArray: string | null = null;
+        
+        // Method 1: Standard JSON pattern
+        const standardMatch = JSON_ARRAY_PATTERN.exec(fileListText);
+        if (standardMatch) {
+          jsonArray = standardMatch[0];
+        } 
+        // Method 2: Bracketed content
+        else {
+          const openBracketIndex = fileListText.indexOf('[');
+          const closeBracketIndex = fileListText.lastIndexOf(']');
           
-          // Validate paths and fix if necessary
-          fileStructure = fileStructure.map(path => {
-            // Ensure Java files are in correct directory structure if not already
-            if (path.endsWith(".java") && !path.includes("/")) {
-              return `src/main/java/com/pegasus/${pluginName.toLowerCase()}/${path}`;
+          if (openBracketIndex !== -1 && closeBracketIndex !== -1 && openBracketIndex < closeBracketIndex) {
+            jsonArray = fileListText.substring(openBracketIndex, closeBracketIndex + 1);
+          }
+        }
+        
+        // Parse JSON if found
+        if (jsonArray) {
+          try {
+            fileStructure = JSON.parse(jsonArray);
+            
+            // Validate array content
+            if (!Array.isArray(fileStructure) || fileStructure.some(item => typeof item !== 'string')) {
+              throw new Error("Invalid array structure");
             }
-            // Ensure resource files are in the right place
-            if ((path === "plugin.yml" || path === "config.yml") && !path.includes("/")) {
-              return `src/main/resources/${path}`;
-            }
-            return path;
-          });
-        } else {
-          throw new Error("Could not extract file structure");
+            
+            // Fix paths if needed
+            const pluginLower = pluginName.toLowerCase();
+            fileStructure = fileStructure.map(path => {
+              if (path.endsWith(".java") && !path.includes("/")) {
+                return `src/main/java/com/pegasus/${pluginLower}/${path}`;
+              }
+              if ((path === "plugin.yml" || path === "config.yml") && !path.includes("/")) {
+                return `src/main/resources/${path}`;
+              }
+              return path;
+            });
+          } catch (parseError) {
+            console.warn("JSON parse error:", parseError);
+            throw parseError;
+          }
+        } 
+        // Method 3: Extract by file extension
+        else {
+          FILE_EXTENSION_PATTERN.lastIndex = 0;
+          const fileMatches = fileListText.match(FILE_EXTENSION_PATTERN);
+          
+          if (fileMatches && fileMatches.length > 0) {
+            fileStructure = [...new Set(fileMatches)]; // Remove duplicates
+          } else {
+            throw new Error("No file references found");
+          }
+        }
+        
+        // Ensure we have files
+        if (fileStructure.length === 0) {
+          throw new Error("Empty file list");
         }
       } catch (e) {
-        console.warn("Error parsing file structure, using default structure", e);
-        // Create default structure using the extracted plugin name
+        // Fallback to default structure
+        const pluginLower = pluginName.toLowerCase();
         fileStructure = [
           "pom.xml",
           "src/main/resources/plugin.yml",
-          `src/main/java/com/pegasus/${pluginName.toLowerCase()}/Main.java`,
+          `src/main/java/com/pegasus/${pluginLower}/Main.java`,
         ];
+        console.log("Using default file structure due to error:", e);
       }
 
       console.log("Files to generate:", fileStructure);
 
-      // PHASE 4: Code Generation
-      console.log("Generating all plugin files together...");
-      
-      // Optimize the prompt to be more concise and focused
+      // Generate all files with optimized prompt
+      const pluginLower = pluginName.toLowerCase();
       const multiFileGenPrompt = `
         Implement a complete Minecraft plugin based on:
         
@@ -410,9 +470,9 @@ createRoutes.post(
         ${fileStructure.join("\n")}
         
         GUIDELINES:
-        - Always use "com.pegasus.${pluginName.toLowerCase()}" as root package
+        - Always use "com.pegasus.${pluginLower}" as root package
         - Follow blueprint class relationships exactly
-        - No JetBrains annotations (@NotNull, @Nullable)
+        - No JetBrains annotations
         - For pom.xml: Spigot 1.19.3 API, Java 11, Maven Shade Plugin 3.4.1
         - Ensure consistent package names across imports
         - Make sure all classes compile without errors
@@ -426,65 +486,33 @@ createRoutes.post(
       const multiFileResult = await proModel.generateContent(multiFileGenPrompt);
       const multiFileResponse = await multiFileResult.response.text();
 
-      // Extract all files from the response with optimized processing
+      // Extract and process files efficiently
       const files: Record<string, string> = {};
-      const filePattern = /---FILE_START:(.*?)---([\s\S]*?)---FILE_END---/g;
       let fileMatch;
-
-      while ((fileMatch = filePattern.exec(multiFileResponse)) !== null) {
+      
+      // Reset RegExp lastIndex for reuse
+      FILE_PATTERN.lastIndex = 0;
+      while ((fileMatch = FILE_PATTERN.exec(multiFileResponse)) !== null) {
         const filePath = fileMatch[1].trim();
-        let fileContent = fileMatch[2].trim();
+        let fileContent = cleanContent(fileMatch[2].trim());
 
-        // Clean content in one pass with combined regex
-        fileContent = fileContent
-          .replace(/^```(?:java|xml|yml|yaml)?\s*\n?/i, "")
-          .replace(/\n?```\s*$/g, "")
-          .replace(/```/g, "");
-
-        // Process different file types efficiently
+        // Apply type-specific processing
         if (filePath.endsWith(".java")) {
-          // Process Java files
-          fileContent = fileContent
-            // Fix invalid API calls
-            .replace(/pig\.setAngry\(([^)]+)\)/g, 
-              '// Pig.setAngry() doesn\'t exist in Bukkit API \n    pig.setPersistent(true);\n    pig.setCustomName("Angry Pig");\n    pig.setMetadata("angry", new FixedMetadataValue(plugin, true));')
-            // Add metadata import if needed
-            .replace(/(import .+;\n\n)/, function(match) {
-              return fileContent.includes("setMetadata") && !fileContent.includes("import org.bukkit.metadata.FixedMetadataValue") 
-                ? match + "import org.bukkit.metadata.FixedMetadataValue;\n" 
-                : match;
-            })
-            // Remove JetBrains annotations in one pass
-            .replace(/import org\.jetbrains\.annotations\.[^;]*;(\r?\n|\r)?/g, "")
-            .replace(/@NotNull |@Nullable /g, "");
-          
-          // Handle package declarations
-          const packageMatch = filePath.match(/src\/main\/java\/(.*\/)/);
-          if (packageMatch) {
-            const packageName = packageMatch[1].replace(/\//g, ".").replace(/\.$/, "");
-            const packageRegex = /^package .*?;(\r?\n|\r)+/;
-            const cleanedContent = fileContent.replace(packageRegex, "");
-            
-            fileContent = cleanedContent.trim().startsWith("package") 
-              ? cleanedContent 
-              : `package ${packageName};\n\n${cleanedContent}`;
-          }
+          fileContent = processJavaFile(filePath, fileContent, pluginName);
         } else if (filePath === "pom.xml" || filePath.endsWith(".xml")) {
-          // Process XML files
           fileContent = fileContent.replace(/^[^<]*(<\?xml|<project)/, "$1");
           if (!fileContent.startsWith("<?xml")) {
             fileContent = '<?xml version="1.0" encoding="UTF-8"?>\n' + fileContent;
           }
           
-          // Make sure artifactId uses the plugin name
-          if (!fileContent.includes(`<artifactId>${pluginName.toLowerCase()}</artifactId>`)) {
+          if (!fileContent.includes(`<artifactId>${pluginLower}</artifactId>`)) {
             fileContent = fileContent.replace(
               /<artifactId>(.*?)<\/artifactId>/,
-              `<artifactId>${pluginName.toLowerCase()}</artifactId>`
+              `<artifactId>${pluginLower}</artifactId>`
             );
           }
         } else if (filePath.endsWith("plugin.yml")) {
-          // Ensure plugin.yml has the correct name
+          // Fix plugin.yml
           if (!fileContent.includes(`name: ${pluginName}`)) {
             fileContent = fileContent.replace(/name: .*/, `name: ${pluginName}`);
             if (!fileContent.includes("name:")) {
@@ -492,234 +520,156 @@ createRoutes.post(
             }
           }
           
-          // Ensure main class path is correct
-          const mainClassRegex = /main: .*?\n/;
-          const correctMainClass = `main: com.pegasus.${pluginName.toLowerCase()}.Main`;
-          if (fileContent.match(mainClassRegex)) {
-            fileContent = fileContent.replace(mainClassRegex, `main: com.pegasus.${pluginName.toLowerCase()}.Main\n`);
-          } else if (!fileContent.includes("main:")) {
-            fileContent += `\nmain: com.pegasus.${pluginName.toLowerCase()}.Main`;
+          // Fix main class
+          const correctMainClass = `main: com.pegasus.${pluginLower}.Main`;
+          if (!fileContent.includes(correctMainClass)) {
+            fileContent = fileContent.replace(/main: .*\n/, `${correctMainClass}\n`);
+            if (!fileContent.includes("main:")) {
+              fileContent += `\n${correctMainClass}`;
+            }
           }
         }
 
-        // Replace any yourusername with pegasus and ensure package names match plugin name
+        // General fixes for any file type
         fileContent = fileContent
-          .replace(/com\.yourusername/g, `com.pegasus.${pluginName.toLowerCase()}`)
-          .replace(/com\.pegasus\.plugin/g, `com.pegasus.${pluginName.toLowerCase()}`)
+          .replace(/com\.yourusername/g, `com.pegasus.${pluginLower}`)
+          .replace(/com\.pegasus\.plugin/g, `com.pegasus.${pluginLower}`)
           .replace(/yourusername/g, "pegasus");
 
         files[filePath] = fileContent;
-        console.log(`Extracted file: ${filePath}`);
+        console.log(`Generated: ${filePath}`);
       }
 
-      // If no files were extracted, fall back to individual generation
+      // Fallback to individual generation if needed
       if (Object.keys(files).length === 0) {
-        console.warn("Failed to extract files from multi-file generation, falling back to standard approach");
+        console.warn("Falling back to individual file generation");
         
-        // Simplified individual file generation using the blueprint directly
-        for (const filePath of fileStructure) {
-          console.log(`Generating individual file: ${filePath}`);
-          
+        // Generate each file separately in parallel for speed
+        const filePromises = fileStructure.map(async (filePath) => {
           const singleFilePrompt = `
             Create a single Minecraft plugin file based on this blueprint:
             
-            ${pluginBlueprint}
+            BLUEPRINT EXCERPT:
+            ${pluginBlueprint.substring(0, 3000)}...
             
             PLUGIN NAME: ${pluginName}
-            
             Generate ONLY this file: ${filePath}
+            Use package: com.pegasus.${pluginLower}
             
-            Use package: com.pegasus.${pluginName.toLowerCase()}
-            
-            Return the complete implementation of the file. NO explanations or markdown, JUST the file content.
+            Return the complete implementation without explanations or markdown formatting.
           `;
           
           const singleFileResult = await flashModel.generateContent(singleFilePrompt);
           const singleFileContent = await singleFileResult.response.text();
+          const cleanedContent = cleanContent(singleFileContent);
           
-          // Clean the response
-          let fileContent = singleFileContent
-            .replace(/^```(?:java|xml|yml|yaml)?\s*\n?/i, "")
-            .replace(/\n?```\s*$/g, "")
-            .replace(/```/g, "");
-            
-          files[filePath] = fileContent;
-        }
+          return { filePath, content: cleanedContent };
+        });
+        
+        // Wait for all files to be generated
+        const fileResults = await Promise.all(filePromises);
+        fileResults.forEach(({ filePath, content }) => {
+          files[filePath] = content;
+        });
       }
 
-      // PHASE 5: Cross-file validation with optimized prompt
-      console.log("Performing cross-file validation...");
-      const validationPrompt = `
-        Check these Minecraft plugin files for consistency issues:
-        
-        ${Object.entries(files)
+      // Perform cross-file validation and cleanup if needed
+      if (Object.keys(files).length > 1) {
+        // Simplified validation - focus on just the first 200 chars of each file
+        const validationSamples = Object.entries(files)
           .map(([path, content]) => `${path}:\n${content.substring(0, 200)}...[truncated]`)
-          .join("\n\n")}
+          .join("\n\n");
         
-        Focus ONLY on critical issues: method signature mismatches, inconsistent package names,
-        and missing class imports.
-        
-        Return ONLY JSON: {"status": "consistent"} or {"issues": [{
-          "fileA": "path1",
-          "fileB": "path2", 
-          "issue": "description", 
-          "fix": "solution"
-        }]}
-      `;
-
-      const validationResult = await flashModel.generateContent(validationPrompt);
-      const validationText = await validationResult.response.text();
-
-      let inconsistencies: InconsistencyResponse = {};
-      try {
-        const match = validationText.match(/\{[\s\S]*\}/);
-        if (match) {
-          inconsistencies = JSON.parse(match[0]);
-        }
-      } catch (e) {
-        console.warn("Error parsing validation results, proceeding with generation", e);
-      }
-
-      // Phase 6: Fix inconsistencies programmatically where possible
-      if (Object.keys(inconsistencies).length > 0 && !("status" in inconsistencies)) {
-        console.log("Fixing inconsistencies between files programmatically...");
-
-        // Properly handled typed array of issues
-        let issues: InconsistencyIssue[] = [];
-        
-        if (inconsistencies.issues && Array.isArray(inconsistencies.issues)) {
-          issues = inconsistencies.issues;
-        } else {
-          // Cast the object to any before extracting values to avoid TypeScript errors
-          const incObj = inconsistencies as any;
-          issues = Object.values(incObj);
-        }
-
-        for (const issue of issues) {
-          const fileA = issue.fileA;
-          const fileB = issue.fileB;
+        const validationPrompt = `
+          Check these Minecraft plugin files for consistency issues:
           
-          console.log(`Fixing inconsistency between ${fileA} and ${fileB}`);
+          ${validationSamples}
           
-          // Simple pattern-based fixes
-          if (issue.issue.toLowerCase().includes("package")) {
-            // Fix package inconsistencies
-            const correctPackageMatch = issue.fix.match(/should be ['"]([^'"]+)['"]/);
-            if (correctPackageMatch) {
-              const correctPackage = correctPackageMatch[1];
+          Focus ONLY on critical issues: method signature mismatches, inconsistent package names,
+          and missing class imports.
+          
+          Return ONLY JSON: {"status": "consistent"} or {"issues": [{
+            "fileA": "path1",
+            "fileB": "path2", 
+            "issue": "description", 
+            "fix": "solution"
+          }]}
+        `;
+
+        try {
+          const validationResult = await flashModel.generateContent(validationPrompt);
+          const validationText = await validationResult.response.text();
+          
+          // Extract and parse JSON response
+          const match = validationText.match(/\{[\s\S]*\}/);
+          if (match) {
+            const inconsistencies: InconsistencyResponse = JSON.parse(match[0]);
+            
+            // Fix inconsistencies if needed
+            if (inconsistencies.issues && inconsistencies.issues.length > 0) {
+              console.log("Fixing inconsistencies...");
               
-              // Fix package declaration
-              files[fileA] = files[fileA].replace(/package\s+[^;]+;/, `package ${correctPackage};`);
-              files[fileB] = files[fileB].replace(/package\s+[^;]+;/, `package ${correctPackage};`);
-              
-              // Fix imports referencing these packages
-              const oldPackageMatch = issue.issue.match(/['"]([^'"]+)['"]\s+vs\s+['"]([^'"]+)['"]/);
-              if (oldPackageMatch) {
-                const wrongPackage = issue.issue.includes(fileA) ? oldPackageMatch[1] : oldPackageMatch[2];
+              // Process each issue
+              for (const issue of inconsistencies.issues) {
+                const { fileA, fileB, issue: issueDesc, fix } = issue;
                 
-                // Replace wrong package in import statements
-                for (const file in files) {
-                  files[file] = files[file].replace(
-                    new RegExp(`import\\s+${wrongPackage}\\.`, 'g'), 
-                    `import ${correctPackage}.`
-                  );
+                if (issueDesc.toLowerCase().includes("package")) {
+                  // Fix package inconsistencies
+                  const correctPackageMatch = fix.match(/should be ['"]([^'"]+)['"]/);
+                  if (correctPackageMatch && files[fileA] && files[fileB]) {
+                    const correctPackage = correctPackageMatch[1];
+                    
+                    // Apply fixes to both files
+                    files[fileA] = files[fileA].replace(/package\s+[^;]+;/, `package ${correctPackage};`);
+                    files[fileB] = files[fileB].replace(/package\s+[^;]+;/, `package ${correctPackage};`);
+                    
+                    // Fix imports in all files
+                    const wrongPackageMatch = issueDesc.match(/['"]([^'"]+)['"]\s+vs\s+['"]([^'"]+)['"]/);
+                    if (wrongPackageMatch) {
+                      const wrongPackage = issueDesc.includes(fileA) ? wrongPackageMatch[1] : wrongPackageMatch[2];
+                      
+                      Object.keys(files).forEach(file => {
+                        files[file] = files[file].replace(
+                          new RegExp(`import\\s+${wrongPackage}\\.`, 'g'), 
+                          `import ${correctPackage}.`
+                        );
+                      });
+                    }
+                  }
                 }
               }
             }
-          } else if (issue.issue.toLowerCase().includes("method signature") || 
-                    issue.issue.toLowerCase().includes("parameter")) {
-            // For complex method signature mismatches, use the flash model
-            const fixPrompt = `
-              Fix this method signature inconsistency:
-              ISSUE: ${issue.issue}
-              FIX: ${issue.fix}
-              
-              File A (${fileA}):
-              ${files[fileA].substring(0, 300)}
-              
-              File B (${fileB}):
-              ${files[fileB].substring(0, 300)}
-              
-              Return ONLY the correct method signature that should be used in both files.
-            `;
-            
-            const fixResult = await flashModel.generateContent(fixPrompt);
-            const fixText = await fixResult.response.text();
-            
-            // Extract the corrected method signature
-            const methodMatch = fixText.match(/(?:public|private|protected)[\s\S]+?;/);
-            if (methodMatch) {
-              const correctSignature = methodMatch[0];
-              const methodName = correctSignature.match(/\s(\w+)\s*\(/)?.[1];
-              
-              if (methodName) {
-                // Replace the method signatures in both files
-                const methodRegex = new RegExp(
-                  `(?:public|private|protected)[\\s\\S]+?${methodName}\\s*\\([\\s\\S]+?\\)\\s*\\{`, 'g'
-                );
-                
-                files[fileA] = files[fileA].replace(methodRegex, 
-                  correctSignature.replace(/;$/, "") + " {"
-                );
-                
-                files[fileB] = files[fileB].replace(methodRegex, 
-                  correctSignature.replace(/;$/, "") + " {"
-                );
-              }
-            }
           }
+        } catch (e) {
+          console.warn("Validation error, continuing with generation:", e);
         }
       }
 
-      // Final cleanup pass
-      console.log("Performing final cleanup...");
-      for (const filePath in files) {
-        // Batch replacements for efficiency
-        files[filePath] = files[filePath]
-          .replace(/com\.yourusername/g, `com.pegasus.${pluginName.toLowerCase()}`)
-          .replace(/com\.pegasus\.plugin/g, `com.pegasus.${pluginName.toLowerCase()}`)
-          .replace(/yourusername/g, "pegasus")
-          .replace(/@NotNull |@Nullable /g, "");
-          
-        // Specific Java import fixes
-        if (filePath.endsWith(".java")) {
-          const lines = files[filePath].split("\n");
-          const fixedLines = lines.map(line => {
-            if (line.startsWith("import ") && line.includes(".yourusername.")) {
-              return line.replace(".yourusername.", ".pegasus.");
-            }
-            return line;
-          });
-          files[filePath] = fixedLines.join("\n");
-        }
-      }
-
-      // Calculate approximate JAR path for response (this is what the bash script would create)
-      const jarPath = `target/${pluginName.toLowerCase()}-1.0-SNAPSHOT.jar`;
+      // Prepare response data
+      const jarPath = `target/${pluginLower}-1.0-SNAPSHOT.jar`;
       const processingTime = ((Date.now() - startTime) / 1000).toFixed(2);
 
       // Cache the result
       pluginCache.set(cacheKey, files);
 
-      // Send the generated files as response in a format compatible with the Node script
+      // Send the response
       res.status(200).json({
         status: "success",
-        success: true, // For compatibility with the Node script
+        success: true,
         message: "Minecraft plugin generated successfully",
         data: files,
         files: Object.keys(files),
         pluginName: pluginName,
         jarPath: jarPath,
         processingTime: `${processingTime}s`,
-        // The following fields are included for compatibility with your Node.js script
-        outputDir: "", // This will be set by the node script
+        outputDir: "",
         log: `Processed plugin generation in ${processingTime} seconds. Generated ${Object.keys(files).length} files.`,
       });
     } catch (error) {
       console.error("Error generating Minecraft plugin:", error);
       res.status(500).json({
         status: "error",
-        success: false, // For compatibility with the Node script
+        success: false,
         message: "Failed to generate Minecraft plugin",
         error: (error as Error).message,
       });
