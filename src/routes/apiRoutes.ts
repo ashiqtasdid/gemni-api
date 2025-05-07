@@ -124,8 +124,13 @@ async function compilePlugin(prompt: string, token: string, files: Record<string
     
     console.log(`Compiling plugin at: ${outputDir}`);
     
-    // Run bash.sh script with prompt, token, and output directory
-    const bashProcess = spawn('bash', [BASH_SCRIPT_PATH, prompt, token, outputDir]);
+    // Call the bash script to compile the plugin
+    const bashProcess = spawn('bash', [
+      BASH_SCRIPT_PATH, 
+      outputDir,         // Plugin directory
+      token,             // Authentication token
+      process.env.API_HOST || 'http://localhost:5000' // API host
+    ]);
     
     let stdoutData = '';
     let stderrData = '';
@@ -145,20 +150,41 @@ async function compilePlugin(prompt: string, token: string, files: Record<string
     bashProcess.on('close', (code: number | null) => {
       console.log(`Bash script exited with code ${code}`);
       
-      // Extract JAR path from stdout
+      // Check for build result JSON file
+      let success = false;
       let jarPath: string | null = null;
-      const jarPathMatch = stdoutData.match(/PLUGIN_JAR_PATH:(.*)/);
+      let buildOutput = stdoutData + stderrData;
       
-      if (jarPathMatch && jarPathMatch[1]) {
-        jarPath = jarPathMatch[1].trim();
-        console.log(`Found JAR path: ${jarPath}`);
+      try {
+        const resultFile = path.join(outputDir, 'build_result.json');
+        if (fs.existsSync(resultFile)) {
+          const buildResult = JSON.parse(fs.readFileSync(resultFile, 'utf8'));
+          success = buildResult.success;
+          
+          if (buildResult.jarPath) {
+            jarPath = path.join(outputDir, buildResult.jarPath);
+          }
+        } else {
+          // Fallback to checking for JAR manually
+          const targetDir = path.join(outputDir, 'target');
+          if (fs.existsSync(targetDir)) {
+            const files = fs.readdirSync(targetDir);
+            const jarFile = files.find(file => file.endsWith('.jar') && !file.includes('original'));
+            if (jarFile) {
+              jarPath = path.join(targetDir, jarFile);
+              success = true;
+            }
+          }
+        }
+      } catch (error) {
+        console.error("Error processing build results:", error);
       }
       
       resolve({
-        success: code === 0 && jarPath !== null,
+        success,
         jarPath,
-        buildOutput: stdoutData + stderrData,
-        buildId // Return the generated buildId
+        buildOutput,
+        buildId
       });
     });
   });
@@ -784,6 +810,7 @@ createRoutes.post(
         data: files,
         files: Object.keys(files),
         pluginName: pluginName,
+        buildId: buildId || `plugin-${Date.now()}`, // Add buildId even without compilation
         jarPath: jarPath,
         processingTime: `${processingTime}s`,
         outputDir: "",
@@ -812,9 +839,19 @@ buildRoutes.get(
   (req: Request, res: Response): void => {
     try {
       const { buildId } = req.params;
+      console.log(`Checking status for buildId: ${buildId}`);
+      
       const pluginDir = path.join(PLUGINS_BASE_DIR, buildId);
+      console.log(`Looking for directory: ${pluginDir}`);
+      console.log(`Directory exists: ${fs.existsSync(pluginDir)}`);
       
       if (!fs.existsSync(pluginDir)) {
+        console.log(`Build directory not found: ${pluginDir}`);
+        
+        // List all available build directories for debugging
+        const existingBuilds = fs.readdirSync(PLUGINS_BASE_DIR);
+        console.log(`Available builds: ${existingBuilds.join(', ')}`);
+        
         res.status(404).json({
           success: false,
           message: `Build ${buildId} not found`

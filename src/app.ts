@@ -8,6 +8,7 @@ import routes from './routes';
 import bodyParser from 'body-parser';
 import { execSync } from 'child_process';
 import path from 'path';
+import apiRoutes from "./routes/apiRoutes";
 
 // Load environment variables
 dotenv.config();
@@ -86,6 +87,11 @@ app.get("/", (req: Request, res: Response) => {
 
 // All API routes - using a single unified router
 app.use("/api", routes);
+
+// Route registration
+app.use("/api/fix", apiRoutes.fixRoutes);
+app.use("/api/create", apiRoutes.createRoutes);
+app.use("/api/build", apiRoutes.buildRoutes);  // Make sure this line exists!
 
 // Error handling middleware
 app.use(errorHandler);
