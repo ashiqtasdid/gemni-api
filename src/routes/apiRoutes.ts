@@ -5,6 +5,8 @@ import dotenv from "dotenv";
 import crypto from "crypto";
 import NodeCache from "node-cache";
 import path from "path";
+import { spawn } from 'child_process';
+import fs from 'fs';
 
 dotenv.config();
 
@@ -51,9 +53,33 @@ interface InconsistencyResponse {
   issues?: InconsistencyIssue[];
 }
 
+interface CompileResult {
+  success: boolean;
+  jarPath: string | null;
+  buildOutput: string;
+  buildId: string; // Add this
+}
+
 // Create separate routers
 const fixRoutes: Router = express.Router();
 const createRoutes: Router = express.Router();
+
+// Base directory for plugins
+const PLUGINS_BASE_DIR = path.join(__dirname, '../../generated-plugins');
+if (!fs.existsSync(PLUGINS_BASE_DIR)) {
+  fs.mkdirSync(PLUGINS_BASE_DIR, { recursive: true });
+}
+
+// Path to bash script
+const BASH_SCRIPT_PATH = path.join(__dirname, '../../bash.sh');
+
+// Make bash script executable on Linux
+try {
+  fs.chmodSync(BASH_SCRIPT_PATH, '755');
+  console.log(`Made ${BASH_SCRIPT_PATH} executable`);
+} catch (error) {
+  console.warn(`Warning: Could not set executable permissions on ${BASH_SCRIPT_PATH}`, error);
+}
 
 // Helper functions for code reuse and optimized processing
 const getModel = (modelConfig: any, config: any) => {
@@ -71,7 +97,72 @@ const hashString = (input: string): string => {
   return crypto.createHash('md5').update(input).digest('hex');
 };
 
-
+// Function to compile the plugin using bash.sh
+async function compilePlugin(prompt: string, token: string, files: Record<string, string>): Promise<CompileResult> {
+  return new Promise(async (resolve) => {
+    // Generate unique ID for this build
+    const buildId = `plugin-${Date.now()}`;
+    const outputDir = path.join(PLUGINS_BASE_DIR, buildId);
+    
+    // Create output directory
+    fs.mkdirSync(outputDir, { recursive: true });
+    
+    // Write files to disk
+    for (const [filePath, content] of Object.entries(files)) {
+      const fullPath = path.join(outputDir, filePath);
+      const fileDir = path.dirname(fullPath);
+      
+      // Create directory if it doesn't exist
+      if (!fs.existsSync(fileDir)) {
+        fs.mkdirSync(fileDir, { recursive: true });
+      }
+      
+      // Write file
+      fs.writeFileSync(fullPath, content);
+      console.log(`Created file: ${fullPath}`);
+    }
+    
+    console.log(`Compiling plugin at: ${outputDir}`);
+    
+    // Run bash.sh script with prompt, token, and output directory
+    const bashProcess = spawn('bash', [BASH_SCRIPT_PATH, prompt, token, outputDir]);
+    
+    let stdoutData = '';
+    let stderrData = '';
+    
+    bashProcess.stdout.on('data', (data: Buffer) => {
+      const output = data.toString();
+      stdoutData += output;
+      console.log(`[BASH] ${output.trim()}`);
+    });
+    
+    bashProcess.stderr.on('data', (data: Buffer) => {
+      const output = data.toString();
+      stderrData += output;
+      console.error(`[BASH-ERR] ${output.trim()}`);
+    });
+    
+    bashProcess.on('close', (code: number | null) => {
+      console.log(`Bash script exited with code ${code}`);
+      
+      // Extract JAR path from stdout
+      let jarPath: string | null = null;
+      const jarPathMatch = stdoutData.match(/PLUGIN_JAR_PATH:(.*)/);
+      
+      if (jarPathMatch && jarPathMatch[1]) {
+        jarPath = jarPathMatch[1].trim();
+        console.log(`Found JAR path: ${jarPath}`);
+      }
+      
+      resolve({
+        success: code === 0 && jarPath !== null,
+        jarPath,
+        buildOutput: stdoutData + stderrData,
+        buildId // Return the generated buildId
+      });
+    });
+  });
+}
 
 // Process Java file content with optimized batch replacements
 const processJavaFile = (filePath: string, content: string, pluginName: string): string => {
@@ -264,6 +355,10 @@ createRoutes.post(
       });
       return;
     }
+
+    // Declare these variables at the start of the function
+    let compilationResult: CompileResult | null = null;
+    let buildId: string | null = null;
 
     try {
       // Check cache
@@ -654,7 +749,34 @@ createRoutes.post(
       // Cache the result
       pluginCache.set(cacheKey, files);
 
-      // Send the response
+      // Check if compilation is requested before sending response
+      if (req.body.compile === true) {
+        console.log("Compiling plugin with bash.sh...");
+        try {
+          compilationResult = await compilePlugin(prompt, req.headers.authorization?.split(' ')[1] || '', files);
+          buildId = compilationResult.buildId;
+          
+          // Send response with compilation results
+          res.status(200).json({
+            status: "success",
+            success: true,
+            message: compilationResult.success ? "Plugin generated and compiled successfully" : "Plugin generated but compilation failed",
+            data: files,
+            files: Object.keys(files),
+            pluginName: pluginName,
+            buildId: buildId,
+            buildOutput: compilationResult.buildOutput,
+            jarPath: compilationResult.jarPath,
+            processingTime: `${processingTime}s`,
+          });
+          return;
+        } catch (error) {
+          console.error("Error compiling plugin:", error);
+          // If compilation fails, we'll still send the generated files below
+        }
+      }
+
+      // Send response without compilation results if compilation wasn't requested or failed
       res.status(200).json({
         status: "success",
         success: true,
@@ -667,6 +789,7 @@ createRoutes.post(
         outputDir: "",
         log: `Processed plugin generation in ${processingTime} seconds. Generated ${Object.keys(files).length} files.`,
       });
+
     } catch (error) {
       console.error("Error generating Minecraft plugin:", error);
       res.status(500).json({
@@ -679,7 +802,138 @@ createRoutes.post(
   }
 );
 
+// Additional routes for build management
+const buildRoutes: Router = express.Router();
+
+// Endpoint to get build status
+buildRoutes.get(
+  "/status/:buildId",
+  verifyToken,
+  (req: Request, res: Response): void => {
+    try {
+      const { buildId } = req.params;
+      const pluginDir = path.join(PLUGINS_BASE_DIR, buildId);
+      
+      if (!fs.existsSync(pluginDir)) {
+        res.status(404).json({
+          success: false,
+          message: `Build ${buildId} not found`
+        });
+        return;
+      }
+      
+      // Check if target directory exists (build has been attempted)
+      const targetExists = fs.existsSync(path.join(pluginDir, 'target'));
+      
+      // Check if JAR file exists (build was successful)
+      let jarFile: string | null = null;
+      if (targetExists) {
+        const targetDir = path.join(pluginDir, 'target');
+        const files = fs.readdirSync(targetDir);
+        const jarFileFound = files.find(file => file.endsWith('.jar') && !file.includes('original'));
+        if (jarFileFound) {
+          jarFile = jarFileFound;
+        }
+      }
+      
+      // Get list of all files in the plugin directory
+      const allFiles: string[] = [];
+      function walkDir(dir: string, baseDir: string): void {
+        const files = fs.readdirSync(dir);
+        for (const file of files) {
+          const filePath = path.join(dir, file);
+          const stat = fs.statSync(filePath);
+          if (stat.isDirectory() && file !== 'target') {
+            walkDir(filePath, baseDir);
+          } else if (stat.isFile()) {
+            allFiles.push(path.relative(baseDir, filePath));
+          }
+        }
+      }
+      
+      walkDir(pluginDir, pluginDir);
+      
+      res.json({
+        success: true,
+        buildId: buildId,
+        status: jarFile ? 'completed' : targetExists ? 'failed' : 'pending',
+        jarFile: jarFile,
+        files: allFiles
+      });
+      
+    } catch (error) {
+      console.error("Error checking build status:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to check build status",
+        error: (error as Error).message
+      });
+    }
+  }
+);
+
+// Endpoint to download the JAR file
+buildRoutes.get(
+  "/download/:buildId",
+  verifyToken,
+  (req: Request, res: Response): void => {
+    try {
+      const { buildId } = req.params;
+      const pluginDir = path.join(PLUGINS_BASE_DIR, buildId);
+      
+      if (!fs.existsSync(pluginDir)) {
+        res.status(404).json({
+          success: false,
+          message: `Build ${buildId} not found`
+        });
+        return;
+      }
+      
+      // Find JAR file in the target directory
+      const targetDir = path.join(pluginDir, 'target');
+      if (!fs.existsSync(targetDir)) {
+        res.status(404).json({
+          success: false,
+          message: `No target directory found for build ${buildId}`
+        });
+        return;
+      }
+      
+      // Find the first JAR file (excluding original-*.jar)
+      const files = fs.readdirSync(targetDir);
+      const jarFile = files.find(file => file.endsWith('.jar') && !file.includes('original'));
+      
+      if (!jarFile) {
+        res.status(404).json({
+          success: false,
+          message: `No JAR file found for build ${buildId}`
+        });
+        return;
+      }
+      
+      const jarPath = path.join(targetDir, jarFile);
+      
+      // Set headers for file download
+      res.setHeader('Content-Disposition', `attachment; filename=${jarFile}`);
+      res.setHeader('Content-Type', 'application/java-archive');
+      
+      // Stream the file
+      const fileStream = fs.createReadStream(jarPath);
+      fileStream.pipe(res);
+      
+    } catch (error) {
+      console.error("Error downloading JAR:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to download JAR file",
+        error: (error as Error).message
+      });
+    }
+  }
+);
+
 export default {
   fixRoutes,
   createRoutes,
+  buildRoutes
 };

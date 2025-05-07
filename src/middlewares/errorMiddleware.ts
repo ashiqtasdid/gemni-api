@@ -1,17 +1,20 @@
 import { Request, Response, NextFunction } from 'express';
-import { AppError } from '../types';
+
+interface ErrorWithStatus extends Error {
+  statusCode?: number;
+}
 
 export const errorHandler = (
-  err: AppError, 
-  req: Request, 
-  res: Response, 
+  err: ErrorWithStatus,
+  req: Request,
+  res: Response,
   next: NextFunction
-): void => {
-  err.statusCode = err.statusCode || 500;
-  err.status = err.status || 'error';
-
-  res.status(err.statusCode).json({
-    status: err.status,
-    message: err.message
+) => {
+  const statusCode = err.statusCode || 500;
+  
+  res.status(statusCode).json({
+    success: false,
+    message: err.message || 'An unexpected error occurred',
+    stack: process.env.NODE_ENV === 'production' ? undefined : err.stack
   });
 };
