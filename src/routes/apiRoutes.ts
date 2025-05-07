@@ -71,6 +71,8 @@ const hashString = (input: string): string => {
   return crypto.createHash('md5').update(input).digest('hex');
 };
 
+
+
 // Process Java file content with optimized batch replacements
 const processJavaFile = (filePath: string, content: string, pluginName: string): string => {
   // Handle package declaration
