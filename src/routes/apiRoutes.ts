@@ -487,6 +487,51 @@ public class ${pluginName} extends JavaPlugin {
   return updatedFiles;
 }
 
+// Add this function near your other utility functions
+
+/**
+ * Uses Gemini Flash model to extract a meaningful plugin name from user prompt
+ */
+async function extractPluginName(prompt: string): Promise<string> {
+  console.log("Extracting plugin name using Gemini Flash...");
+  
+  try {
+    const model = getModel(MODEL_CONFIG.flash, MODEL_CONFIG.flash.precision);
+    
+    const namePrompt = `
+      Based on this Minecraft plugin request, determine the BEST, MOST SPECIFIC name for the plugin.
+      The name should be a single word or compound words in PascalCase format (like "WorldGuard" or "EssentialsX").
+      It must contain only letters and numbers, and be descriptive of the plugin's main functionality.
+      
+      USER REQUEST:
+      "${prompt}"
+      
+      Return ONLY the plugin name without any explanation, quotes, or additional text.
+      Example responses: "TeleportPlus", "ChestProtector", "ServerEssentials"
+    `;
+    
+    const nameResult = await model.generateContent(namePrompt);
+    const suggestedName = await nameResult.response.text();
+    
+    // Clean up the response
+    const cleanName = suggestedName
+      .trim()
+      .replace(/[^a-zA-Z0-9]/g, '')
+      .replace(/^[^A-Z]/, match => match.toUpperCase()); // Ensure first letter is uppercase
+    
+    // If name is too short, add "Plugin" suffix
+    const finalName = cleanName.length < 3 ? 'CustomPlugin' : 
+                     cleanName.length < 5 ? cleanName + 'Plugin' : 
+                     cleanName;
+    
+    console.log(`Generated plugin name: ${finalName}`);
+    return finalName;
+  } catch (error) {
+    console.error("Error extracting plugin name:", error);
+    return `MinecraftPlugin${Date.now().toString().slice(-4)}`;
+  }
+}
+
 // Fix routes - optimized for build error resolution
 fixRoutes.post(
   "/",
@@ -674,22 +719,23 @@ createRoutes.post(
       const proModel = getModel(MODEL_CONFIG.pro, MODEL_CONFIG.pro.creative);
       const flashModel = getModel(MODEL_CONFIG.flash, MODEL_CONFIG.flash.creative);
 
-      // Optimized prompts
+      // First extract a proper plugin name using AI
+      const pluginName = await extractPluginName(prompt);
+      const pluginLower = pluginName.toLowerCase();
+
+      console.log(`Using plugin name: ${pluginName}`);
+
+      // Optimized prompts with consistent plugin name
       const refiningPrompt = `
         You are a Minecraft plugin requirements analyst. The user has provided this plugin request:
         
         "${prompt}"
         
-        Your task is to refine and expand this request into a clear, detailed specification for a Minecraft plugin.
+        We've determined the plugin name will be: ${pluginName}
         
-        1. Identify what type of plugin is being requested
-        2. Add any missing technical details that would be needed for implementation
-        3. Clarify ambiguities in the original request
-        4. Structure the refined requirements in a way that makes them clear for plugin developers
-        5. Add Minecraft/Spigot-specific context where relevant
-        6. Ensure all functionality expectations are explicit
+        Your task is to refine and expand this request into a clear, detailed specification.
         
-        Return ONLY the refined, expanded plugin requirements. Do not include explanations about your refinements.
+        // rest of your prompt...
       `;
       
       const blueprintPrompt = `
@@ -698,37 +744,15 @@ createRoutes.post(
         PLUGIN REQUIREMENTS:
         ${prompt}
         
+        PLUGIN NAME: ${pluginName}
+        
         Your task is to create a COMPLETE PLUGIN BLUEPRINT that ensures all files work together consistently.
         
         PART 1: ARCHITECTURE
-        - Plugin name and main class
-        - Package structure (always use com.pegasus.pluginname format)
-        - All required classes with their responsibilities
-        - Command structure
-        - Event listeners
-        - Data storage approach
+        - Use "${pluginName}" as the plugin name and main class name
+        - Package structure (always use com.pegasus.${pluginLower} format)
         
-        PART 2: CLASS RELATIONSHIPS
-        - Define how classes interact with each other
-        - Specify methods that are called between classes
-        - Ensure consistent method signatures across all interaction points
-        
-        PART 3: FILE SPECIFICATIONS
-        For EACH file, provide:
-        1. File path (e.g. "src/main/java/com/pegasus/pluginname/ClassName.java")
-        2. Full class signature
-        3. Required imports
-        4. Fields/properties with types
-        5. Method signatures (parameters and return types)
-        6. Brief implementation notes
-        
-        PART 4: CONFIGURATION
-        - Define all plugin.yml entries
-        - Specify config.yml structure and default values
-        - Any other needed configuration files
-        
-        FORMAT YOUR RESPONSE AS A STRUCTURED BLUEPRINT THAT CAN BE USED TO GENERATE A FULLY FUNCTIONING PLUGIN.
-        DO NOT INCLUDE FULL CODE IMPLEMENTATIONS YET, ONLY STRUCTURED SPECIFICATIONS.
+        // rest of your prompt...
       `;
 
       // Run in parallel for speed
@@ -741,11 +765,6 @@ createRoutes.post(
       const refinedPrompt = await refinedPromptResult.response.text();
       const pluginBlueprint = await blueprintResult.response.text();
       console.log("Parallel generation complete");
-
-      // Extract plugin name with optimized regex matching
-      const pluginNameMatch = PLUGIN_NAME_PATTERN.exec(pluginBlueprint) || 
-                            PLUGIN_NAME_ALT_PATTERN.exec(pluginBlueprint);
-      const pluginName = pluginNameMatch ? pluginNameMatch[1] : "CustomPlugin";
 
       // Get file list with optimized prompt
       console.log("Extracting file list...");
@@ -842,7 +861,6 @@ createRoutes.post(
       console.log("Files to generate:", fileStructure);
 
       // Generate all files with optimized prompt
-      const pluginLower = pluginName.toLowerCase();
       const multiFileGenPrompt = `
         Implement a complete Minecraft plugin based on:
         
