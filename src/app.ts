@@ -92,6 +92,7 @@ app.use("/api", routes);
 app.use("/api/fix", apiRoutes.fixRoutes);
 app.use("/api/create", apiRoutes.createRoutes);
 app.use("/api/build", apiRoutes.buildRoutes);  // Make sure this line exists!
+app.use('/api/plugins', apiRoutes.pluginsRoutes);
 
 // Error handling middleware
 app.use(errorHandler);

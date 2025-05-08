@@ -107,6 +107,11 @@ async function compilePlugin(prompt: string, token: string, files: Record<string
     // Create output directory
     fs.mkdirSync(outputDir, { recursive: true });
     
+    // Save the original prompt to help with identification
+    if (prompt) {
+      fs.writeFileSync(path.join(outputDir, 'prompt.txt'), prompt);
+    }
+    
     // Extract plugin name from files
     const pluginYmlPath = Object.keys(files).find(path => path.endsWith('plugin.yml'));
     let pluginName = "CustomPlugin";
