@@ -1253,8 +1253,335 @@ buildRoutes.get(
   }
 );
 
+// Add this new route after the buildRoutes definition (around line 1197)
+
+// Route for listing all generated plugins
+const pluginsRoutes: Router = express.Router();
+
+pluginsRoutes.get(
+  "/",
+  verifyToken,
+  (req: Request, res: Response): void => {
+    try {
+      console.log("Listing all generated plugins");
+      
+      // Check if plugins directory exists
+      if (!fs.existsSync(PLUGINS_BASE_DIR)) {
+        res.status(404).json({
+          success: false,
+          message: "Plugins directory not found"
+        });
+        return;
+      }
+      
+      // Get all subdirectories in the plugins base directory (each is a build)
+      const pluginDirs = fs.readdirSync(PLUGINS_BASE_DIR, { withFileTypes: true })
+        .filter(dirent => dirent.isDirectory())
+        .map(dirent => dirent.name);
+      
+      // For each directory, gather information about the plugin
+      const plugins = pluginDirs.map(dirName => {
+        const pluginDir = path.join(PLUGINS_BASE_DIR, dirName);
+        
+        // Extract plugin information
+        let pluginName = "Unknown";
+        let jarFile = null;
+        let status = "unknown";
+        let fileCount = 0;
+        
+        // Check if plugin.yml exists to extract the plugin name
+        try {
+          // Look for plugin.yml in src/main/resources or directly in the plugin directory
+          const possiblePaths = [
+            path.join(pluginDir, 'src', 'main', 'resources', 'plugin.yml'),
+            path.join(pluginDir, 'plugin.yml')
+          ];
+          
+          for (const ymlPath of possiblePaths) {
+            if (fs.existsSync(ymlPath)) {
+              const pluginYml = fs.readFileSync(ymlPath, 'utf8');
+              const nameMatch = pluginYml.match(/name: *([A-Za-z0-9_]+)/);
+              if (nameMatch) {
+                pluginName = nameMatch[1];
+                break;
+              }
+            }
+          }
+        } catch (error) {
+          console.warn(`Could not read plugin.yml for ${dirName}:`, error);
+        }
+        
+        // Check for JAR file to determine build status
+        const targetDir = path.join(pluginDir, 'target');
+        if (fs.existsSync(targetDir)) {
+          try {
+            const targetFiles = fs.readdirSync(targetDir);
+            const jarFileFound = targetFiles.find(file => file.endsWith('.jar') && !file.includes('original'));
+            if (jarFileFound) {
+              jarFile = jarFileFound;
+              status = "completed";
+            } else {
+              status = "failed";
+            }
+          } catch (error) {
+            console.warn(`Could not read target directory for ${dirName}:`, error);
+            status = "error";
+          }
+        } else {
+          status = "pending";
+        }
+        
+        // Count files (excluding target directory for efficiency)
+        try {
+          const allFiles: string[] = [];
+          function countFiles(dir: string): void {
+            if (!fs.existsSync(dir)) return;
+            
+            const dirFiles = fs.readdirSync(dir);
+            for (const file of dirFiles) {
+              if (file === 'target') continue;
+              
+              const filePath = path.join(dir, file);
+              const stat = fs.statSync(filePath);
+              if (stat.isDirectory()) {
+                countFiles(filePath);
+              } else if (stat.isFile()) {
+                fileCount++;
+              }
+            }
+          }
+          
+          countFiles(pluginDir);
+        } catch (error) {
+          console.warn(`Could not count files for ${dirName}:`, error);
+        }
+        
+        // Get creation timestamp from the directory name (if in format plugin-timestamp)
+        let createdAt = null;
+        const timestampMatch = dirName.match(/plugin-(\d+)/);
+        if (timestampMatch) {
+          const timestamp = parseInt(timestampMatch[1]);
+          if (!isNaN(timestamp)) {
+            createdAt = new Date(timestamp).toISOString();
+          }
+        }
+        
+        // If we couldn't get timestamp from the name, use directory stats
+        if (!createdAt) {
+          try {
+            const stats = fs.statSync(pluginDir);
+            createdAt = stats.birthtime.toISOString();
+          } catch (error) {
+            console.warn(`Could not get creation time for ${dirName}:`, error);
+            createdAt = new Date().toISOString(); // Use current time as fallback
+          }
+        }
+        
+        // Extract prompt if available
+        let prompt = "";
+        try {
+          const promptPath = path.join(pluginDir, 'prompt.txt');
+          if (fs.existsSync(promptPath)) {
+            prompt = fs.readFileSync(promptPath, 'utf8').substring(0, 100) + "...";
+          }
+        } catch (error) {
+          console.warn(`Could not read prompt for ${dirName}:`, error);
+        }
+        
+        return {
+          id: dirName,
+          name: pluginName,
+          status,
+          createdAt,
+          jarFile,
+          fileCount,
+          buildId: dirName,
+          prompt
+        };
+      });
+      
+      // Sort plugins by creation date (newest first)
+      plugins.sort((a, b) => {
+        if (a.createdAt === null) return 1;
+        if (b.createdAt === null) return -1;
+        return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+      });
+      
+      res.json({
+        success: true,
+        plugins,
+        count: plugins.length,
+        baseDir: PLUGINS_BASE_DIR
+      });
+      
+    } catch (error) {
+      console.error("Error listing plugins:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to list plugins",
+        error: (error as Error).message
+      });
+    }
+  }
+);
+
+// Add a route to get a specific plugin details
+pluginsRoutes.get(
+  "/:buildId",
+  verifyToken,
+  (req: Request, res: Response): void => {
+    try {
+      const { buildId } = req.params;
+      const pluginDir = path.join(PLUGINS_BASE_DIR, buildId);
+      
+      if (!fs.existsSync(pluginDir)) {
+        res.status(404).json({
+          success: false,
+          message: `Plugin ${buildId} not found`
+        });
+        return;
+      }
+      
+      // Extract plugin information (similar to the list route)
+      let pluginName = "Unknown";
+      let jarFile = null;
+      let status = "unknown";
+      let files: string[] = [];
+      
+      // Get plugin.yml info
+      try {
+        const possiblePaths = [
+          path.join(pluginDir, 'src', 'main', 'resources', 'plugin.yml'),
+          path.join(pluginDir, 'plugin.yml')
+        ];
+        
+        for (const ymlPath of possiblePaths) {
+          if (fs.existsSync(ymlPath)) {
+            const pluginYml = fs.readFileSync(ymlPath, 'utf8');
+            const nameMatch = pluginYml.match(/name: *([A-Za-z0-9_]+)/);
+            if (nameMatch) {
+              pluginName = nameMatch[1];
+              break;
+            }
+          }
+        }
+      } catch (error) {
+        console.warn(`Could not read plugin.yml for ${buildId}:`, error);
+      }
+      
+      // Check build status
+      const targetDir = path.join(pluginDir, 'target');
+      if (fs.existsSync(targetDir)) {
+        try {
+          const targetFiles = fs.readdirSync(targetDir);
+          const jarFileFound = targetFiles.find(file => file.endsWith('.jar') && !file.includes('original'));
+          if (jarFileFound) {
+            jarFile = jarFileFound;
+            status = "completed";
+          } else {
+            status = "failed";
+          }
+        } catch (error) {
+          console.warn(`Could not read target directory for ${buildId}:`, error);
+          status = "error";
+        }
+      } else {
+        status = "pending";
+      }
+      
+      // List all files with contents
+      const fileContents: Record<string, string> = {};
+      function walkDir(dir: string, baseDir: string): void {
+        if (!fs.existsSync(dir)) return;
+        
+        const dirFiles = fs.readdirSync(dir);
+        for (const file of dirFiles) {
+          if (file === 'target') continue;
+          
+          const filePath = path.join(dir, file);
+          const stat = fs.statSync(filePath);
+          if (stat.isDirectory()) {
+            walkDir(filePath, baseDir);
+          } else if (stat.isFile()) {
+            const relativePath = path.relative(baseDir, filePath);
+            files.push(relativePath);
+            
+            // Only include content for text files
+            const ext = path.extname(filePath).toLowerCase();
+            if (['.java', '.yml', '.xml', '.txt', '.md', '.properties'].includes(ext)) {
+              try {
+                fileContents[relativePath] = fs.readFileSync(filePath, 'utf8');
+              } catch (error) {
+                console.warn(`Could not read file ${filePath}:`, error);
+                fileContents[relativePath] = "Error reading file";
+              }
+            }
+          }
+        }
+      }
+      
+      walkDir(pluginDir, pluginDir);
+      
+      // Get creation timestamp
+      let createdAt = null;
+      const timestampMatch = buildId.match(/plugin-(\d+)/);
+      if (timestampMatch) {
+        const timestamp = parseInt(timestampMatch[1]);
+        if (!isNaN(timestamp)) {
+          createdAt = new Date(timestamp).toISOString();
+        }
+      }
+      
+      if (!createdAt) {
+        try {
+          const stats = fs.statSync(pluginDir);
+          createdAt = stats.birthtime.toISOString();
+        } catch (error) {
+          console.warn(`Could not get creation time for ${buildId}:`, error);
+          createdAt = new Date().toISOString();
+        }
+      }
+      
+      // Extract prompt if available
+      let prompt = "";
+      try {
+        const promptPath = path.join(pluginDir, 'prompt.txt');
+        if (fs.existsSync(promptPath)) {
+          prompt = fs.readFileSync(promptPath, 'utf8');
+        }
+      } catch (error) {
+        console.warn(`Could not read prompt for ${buildId}:`, error);
+      }
+      
+      res.json({
+        success: true,
+        plugin: {
+          id: buildId,
+          name: pluginName,
+          status,
+          createdAt,
+          jarFile,
+          fileCount: files.length,
+          files,
+          fileContents,
+          prompt
+        }
+      });
+      
+    } catch (error) {
+      console.error(`Error getting plugin ${req.params.buildId}:`, error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to get plugin details",
+        error: (error as Error).message
+      });
+    }
+  }
+);
+
 export default {
   fixRoutes,
   createRoutes,
-  buildRoutes
+  buildRoutes,
+  pluginsRoutes
 };
