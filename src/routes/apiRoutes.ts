@@ -31,7 +31,7 @@ const MODEL_CONFIG = {
   flash: {
     name: "gemini-2.5-flash-preview-04-17",
     precision: { temperature: 0.1, topP: 0.95, topK: 64 },
-    creative: { temperature: 5, topP: 0.95, topK: 64 }
+    creative: { temperature: 1.5, topP: 0.95, topK: 64 }  // Changed from 5 to 1.5
   },
   pro: {
     name: "gemini-2.5-pro-preview-03-25",
