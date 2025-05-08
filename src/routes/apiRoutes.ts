@@ -1330,13 +1330,23 @@ buildRoutes.get(
       }
       
       // Set proper headers for file download
-      res.setHeader('Content-Disposition', `attachment; filename="${pluginName || jarFile}"`);
+      res.setHeader('Content-Disposition', `attachment; filename="${pluginName ? pluginName + '.jar' : jarFile}"`);
       res.setHeader('Content-Type', 'application/java-archive');
       res.setHeader('Content-Length', fs.statSync(jarPath).size);
       res.setHeader('Cache-Control', 'no-store, max-age=0');
       
       // Stream the file
       const fileStream = fs.createReadStream(jarPath);
+      fileStream.on('error', (error) => {
+        console.error(`Error streaming JAR file:`, error);
+        if (!res.headersSent) {
+          res.status(500).json(formatApiResponse(
+            false, 
+            "Error streaming JAR file",
+            { error: (error as Error).message }
+          ));
+        }
+      });
       fileStream.pipe(res);
       
     } catch (error) {
