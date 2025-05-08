@@ -107,8 +107,22 @@ async function compilePlugin(prompt: string, token: string, files: Record<string
     // Create output directory
     fs.mkdirSync(outputDir, { recursive: true });
     
-    // Write files to disk
-    for (const [filePath, content] of Object.entries(files)) {
+    // Extract plugin name from files
+    const pluginYmlPath = Object.keys(files).find(path => path.endsWith('plugin.yml'));
+    let pluginName = "CustomPlugin";
+    if (pluginYmlPath) {
+      const nameMatch = files[pluginYmlPath].match(/name: *([A-Za-z0-9_]+)/);
+      if (nameMatch) {
+        pluginName = nameMatch[1];
+      }
+    }
+    
+    // Validate files before writing to disk
+    console.log("Validating plugin files before compilation...");
+    const validatedFiles = await validatePluginFiles(files, pluginName);
+    
+    // Write validated files to disk
+    for (const [filePath, content] of Object.entries(validatedFiles)) {
       const fullPath = path.join(outputDir, filePath);
       const fileDir = path.dirname(fullPath);
       
@@ -224,6 +238,254 @@ const processJavaFile = (filePath: string, content: string, pluginName: string):
 
   return result;
 };
+
+// Add this function after the processJavaFile function
+
+async function validatePluginFiles(files: Record<string, string>, pluginName: string): Promise<Record<string, string>> {
+  console.log("Validating plugin files before compilation...");
+  
+  // Create a copy of files to avoid modifying the original
+  const validatedFiles = { ...files };
+  
+  // Get the main class file and path - look for class extending JavaPlugin
+  let mainClassFile = '';
+  let mainClassPath = '';
+  let packageName = '';
+  
+  for (const [path, content] of Object.entries(files)) {
+    if (path.endsWith('.java') && 
+        (content.includes('extends JavaPlugin') || 
+         content.includes('extends org.bukkit.plugin.java.JavaPlugin'))) {
+      mainClassFile = path;
+      const classNameMatch = path.match(/([^\/]+)\.java$/);
+      if (classNameMatch) {
+        mainClassPath = classNameMatch[1];
+      }
+      
+      const packageMatch = content.match(/package\s+([\w.]+);/);
+      if (packageMatch) {
+        packageName = packageMatch[1];
+      }
+      
+      console.log(`Found main class: ${packageName}.${mainClassPath} in ${mainClassFile}`);
+      break;
+    }
+  }
+  
+  // If we haven't found a main class yet, look for class with onEnable/onDisable methods
+  if (!mainClassFile) {
+    for (const [path, content] of Object.entries(files)) {
+      if (path.endsWith('.java') && 
+          (content.includes('void onEnable()') || content.includes('public void onEnable'))) {
+        mainClassFile = path;
+        const classNameMatch = path.match(/([^\/]+)\.java$/);
+        if (classNameMatch) {
+          mainClassPath = classNameMatch[1];
+        }
+        
+        const packageMatch = content.match(/package\s+([\w.]+);/);
+        if (packageMatch) {
+          packageName = packageMatch[1];
+        }
+        
+        console.log(`Found main class by onEnable method: ${packageName}.${mainClassPath} in ${mainClassFile}`);
+        break;
+      }
+    }
+  }
+  
+  // Fix plugin.yml
+  const pluginYmlPath = Object.keys(files).find(path => path.endsWith('plugin.yml'));
+  if (pluginYmlPath && mainClassPath && packageName) {
+    const pluginYml = files[pluginYmlPath];
+    const fullMainClass = `${packageName}.${mainClassPath}`;
+    
+    // Build a properly formatted plugin.yml with the correct main class
+    let updatedPluginYml = pluginYml;
+    
+    // Ensure name is correct
+    if (!updatedPluginYml.includes(`name: ${pluginName}`)) {
+      updatedPluginYml = updatedPluginYml.replace(/name: .*/, `name: ${pluginName}`);
+      if (!updatedPluginYml.includes("name:")) {
+        updatedPluginYml = `name: ${pluginName}\n${updatedPluginYml}`;
+      }
+    }
+    
+    // Replace or add main class
+    if (updatedPluginYml.includes("main:")) {
+      updatedPluginYml = updatedPluginYml.replace(/main: .*/, `main: ${fullMainClass}`);
+    } else {
+      updatedPluginYml = `${updatedPluginYml}\nmain: ${fullMainClass}`;
+    }
+    
+    // Add basic version if missing
+    if (!updatedPluginYml.includes("version:")) {
+      updatedPluginYml = `${updatedPluginYml}\nversion: 1.0`;
+    }
+    
+    // Add API version if missing (for Minecraft 1.13+)
+    if (!updatedPluginYml.includes("api-version:")) {
+      updatedPluginYml = `${updatedPluginYml}\napi-version: 1.19`;
+    }
+    
+    validatedFiles[pluginYmlPath] = updatedPluginYml;
+    console.log(`Updated plugin.yml with main class: ${fullMainClass}`);
+  } else if (pluginYmlPath) {
+    // If we couldn't find the main class, create a generic warning in plugin.yml
+    console.warn("Could not determine main class from Java files!");
+    
+    // Create a simple valid plugin.yml as a fallback
+    const pluginLower = pluginName.toLowerCase();
+    const fallbackMainClass = `com.pegasus.${pluginLower}.${pluginName}`;
+    
+    validatedFiles[pluginYmlPath] = `name: ${pluginName}
+version: 1.0
+main: ${fallbackMainClass}
+api-version: 1.19
+description: A custom Minecraft plugin`;
+    
+    console.log(`Created fallback plugin.yml with main class: ${fallbackMainClass}`);
+  }
+  
+  // Validate with a quick AI check
+  const model = getModel(MODEL_CONFIG.flash, MODEL_CONFIG.flash.precision);
+  
+  // Prioritize files for validation (main class, plugin.yml, pom.xml)
+  const criticalFiles: Record<string, string> = {};
+  if (mainClassFile && validatedFiles[mainClassFile]) {
+    criticalFiles[mainClassFile] = validatedFiles[mainClassFile];
+  }
+  
+  if (pluginYmlPath && validatedFiles[pluginYmlPath]) {
+    criticalFiles[pluginYmlPath] = validatedFiles[pluginYmlPath];
+  }
+  
+  const pomPath = Object.keys(validatedFiles).find(path => path.endsWith('pom.xml'));
+  if (pomPath) {
+    criticalFiles[pomPath] = validatedFiles[pomPath];
+  }
+  
+  // Only run validation if we have critical files
+  if (Object.keys(criticalFiles).length > 0) {
+    const validationPrompt = `
+      You are a Minecraft plugin validator. Check these critical plugin files for errors that would prevent compilation or loading:
+      
+      ${Object.entries(criticalFiles)
+        .map(([path, content]) => `FILE: ${path}\n${content.substring(0, 1000)}${content.length > 1000 ? '...' : ''}`)
+        .join('\n\n===\n\n')
+      }
+      
+      Focus ONLY on critical errors:
+      1. Ensure the main class in plugin.yml exists and extends JavaPlugin
+      2. Check for syntax errors in Java files
+      3. Verify package names match file paths
+      4. Confirm all required imports exist
+      5. Make sure pom.xml has valid dependencies
+      
+      If you find any errors, return ONLY:
+      ---FILE_START:filepath---
+      [corrected content]
+      ---FILE_END---
+      
+      If no errors, respond with "NO_ERRORS_FOUND".
+    `;
+    
+    try {
+      console.log("Running AI validation check on critical files...");
+      const validationResult = await model.generateContent(validationPrompt);
+      const validationText = await validationResult.response.text();
+      
+      if (validationText.includes("NO_ERRORS_FOUND")) {
+        console.log("AI validation: No critical errors found.");
+      } else {
+        console.log("AI validation: Fixing issues...");
+        
+        // Extract fixes
+        let fileMatch;
+        FILE_PATTERN.lastIndex = 0;
+        while ((fileMatch = FILE_PATTERN.exec(validationText)) !== null) {
+          const filePath = fileMatch[1].trim();
+          const fixedContent = cleanContent(fileMatch[2].trim());
+          
+          // Only update if this is a known file
+          if (validatedFiles[filePath]) {
+            validatedFiles[filePath] = fixedContent;
+            console.log(`AI validation fixed: ${filePath}`);
+          }
+        }
+      }
+    } catch (error) {
+      console.warn("AI validation failed:", error);
+      // Continue with the original files if validation fails
+    }
+  }
+  
+  return validatedFiles;
+}
+
+// Add this function after validatePluginFiles
+
+async function ensureMainClassExists(files: Record<string, string>, pluginName: string): Promise<Record<string, string>> {
+  const updatedFiles = { ...files };
+  const pluginLower = pluginName.toLowerCase();
+  
+  // Check if we have a main class
+  let hasMainClass = false;
+  for (const [path, content] of Object.entries(files)) {
+    if (path.endsWith('.java') && 
+        (content.includes('extends JavaPlugin') || 
+         content.includes('extends org.bukkit.plugin.java.JavaPlugin'))) {
+      hasMainClass = true;
+      break;
+    }
+  }
+  
+  // If no main class, generate one
+  if (!hasMainClass) {
+    console.log("No main class found - generating one...");
+    
+    const mainClassPath = `src/main/java/com/pegasus/${pluginLower}/${pluginName}.java`;
+    const mainClass = `package com.pegasus.${pluginLower};
+
+import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.Bukkit;
+
+public class ${pluginName} extends JavaPlugin {
+    @Override
+    public void onEnable() {
+        getLogger().info("${pluginName} has been enabled!");
+        saveDefaultConfig();
+    }
+
+    @Override
+    public void onDisable() {
+        getLogger().info("${pluginName} has been disabled!");
+    }
+}`;
+    
+    updatedFiles[mainClassPath] = mainClass;
+    
+    // Update plugin.yml to point to this class
+    const pluginYmlPath = Object.keys(files).find(path => path.endsWith('plugin.yml'));
+    if (pluginYmlPath) {
+      const fullMainClass = `com.pegasus.${pluginLower}.${pluginName}`;
+      let pluginYml = files[pluginYmlPath];
+      
+      // Replace or add main class
+      if (pluginYml.includes("main:")) {
+        pluginYml = pluginYml.replace(/main: .*/, `main: ${fullMainClass}`);
+      } else {
+        pluginYml = `${pluginYml}\nmain: ${fullMainClass}`;
+      }
+      
+      updatedFiles[pluginYmlPath] = pluginYml;
+    }
+    
+    console.log(`Created main class: ${mainClassPath}`);
+  }
+  
+  return updatedFiles;
+}
 
 // Fix routes - optimized for build error resolution
 fixRoutes.post(
@@ -643,13 +905,14 @@ createRoutes.post(
             }
           }
           
-          // Fix main class
-          const correctMainClass = `main: com.pegasus.${pluginLower}.Main`;
-          if (!fileContent.includes(correctMainClass)) {
-            fileContent = fileContent.replace(/main: .*\n/, `${correctMainClass}\n`);
-            if (!fileContent.includes("main:")) {
-              fileContent += `\n${correctMainClass}`;
-            }
+          // Don't set main class here - it will be validated properly later
+          // Just ensure basic format is correct
+          if (!fileContent.includes("version:")) {
+            fileContent += "\nversion: 1.0";
+          }
+          
+          if (!fileContent.includes("api-version:")) {
+            fileContent += "\napi-version: 1.19";
           }
         }
 
@@ -779,7 +1042,10 @@ createRoutes.post(
       if (req.body.compile === true) {
         console.log("Compiling plugin with bash.sh...");
         try {
-          compilationResult = await compilePlugin(prompt, req.headers.authorization?.split(' ')[1] || '', files);
+          // First validate plugin.yml against main class before compiling
+          const validatedFiles = await validatePluginFiles(files, pluginName);
+          
+          compilationResult = await compilePlugin(prompt, req.headers.authorization?.split(' ')[1] || '', validatedFiles);
           buildId = compilationResult.buildId;
           
           // Send response with compilation results
@@ -787,8 +1053,8 @@ createRoutes.post(
             status: "success",
             success: true,
             message: compilationResult.success ? "Plugin generated and compiled successfully" : "Plugin generated but compilation failed",
-            data: files,
-            files: Object.keys(files),
+            data: validatedFiles, // Return the validated files
+            files: Object.keys(validatedFiles),
             pluginName: pluginName,
             buildId: buildId,
             buildOutput: compilationResult.buildOutput,
