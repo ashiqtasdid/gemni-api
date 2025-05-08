@@ -31,7 +31,7 @@ const MODEL_CONFIG = {
   flash: {
     name: "gemini-2.5-flash-preview-04-17",
     precision: { temperature: 0.1, topP: 0.95, topK: 64 },
-    creative: { temperature: 0.5, topP: 0.95, topK: 64 }
+    creative: { temperature: 5, topP: 0.95, topK: 64 }
   },
   pro: {
     name: "gemini-2.5-pro-preview-03-25",
@@ -97,11 +97,26 @@ const hashString = (input: string): string => {
   return crypto.createHash('md5').update(input).digest('hex');
 };
 
+// Helper function for consistent API responses
+const formatApiResponse = (success: boolean, message: string, data?: any) => {
+  return {
+    success,
+    message,
+    ...(data && { ...data }),
+    timestamp: new Date().toISOString()
+  };
+};
+
 // Function to compile the plugin using bash.sh
-async function compilePlugin(prompt: string, token: string, files: Record<string, string>): Promise<CompileResult> {
+async function compilePlugin(
+  prompt: string, 
+  token: string, 
+  files: Record<string, string>,
+  providedBuildId?: string
+): Promise<CompileResult> {
   return new Promise(async (resolve) => {
-    // Generate unique ID for this build
-    const buildId = `plugin-${Date.now()}`;
+    // Generate unique ID for this build or use provided one
+    const buildId = providedBuildId || `plugin-${Date.now()}`;
     const outputDir = path.join(PLUGINS_BASE_DIR, buildId);
     
     // Create output directory
@@ -683,20 +698,46 @@ createRoutes.post(
   "/",
   verifyToken,
   async (req: Request, res: Response): Promise<void> => {
-    // Get and validate prompt
-    const { prompt } = req.body;
+    // Get and validate prompt and buildId
+    const { prompt, buildId: requestBuildId } = req.body;
     if (!prompt) {
-      res.status(400).json({
-        status: "fail",
-        success: false,
-        message: "Request must contain a prompt field",
-      });
+      res.status(400).json(formatApiResponse(
+        false,
+        "Request must contain a prompt field"
+      ));
       return;
     }
 
     // Declare these variables at the start of the function
     let compilationResult: CompileResult | null = null;
-    let buildId: string | null = null;
+    let buildId: string = requestBuildId || `plugin-${Date.now()}`;
+
+    // Add this to your createRoutes.post handler right after checking the prompt
+    if (req.query.async === 'true' || req.body.async === true) {
+      // Send an immediate response with the build ID
+      res.status(202).json(formatApiResponse(
+        true,
+        "Plugin generation started",
+        {
+          buildId,
+          status: "pending",
+          statusCheckUrl: `/api/build/status/${buildId}`
+        }
+      ));
+      
+      // Continue processing in the background
+      (async () => {
+        try {
+          // Your existing plugin generation code...
+          // Just don't send any more responses
+          console.log(`Background processing for build ${buildId} completed`);
+        } catch (error) {
+          console.error(`Background processing error for ${buildId}:`, error);
+        }
+      })().catch(error => console.error("Unhandled background error:", error));
+      
+      return; // Return early - response already sent
+    }
 
     try {
       // Check cache
@@ -1068,7 +1109,12 @@ createRoutes.post(
           // First validate plugin.yml against main class before compiling
           const validatedFiles = await validatePluginFiles(files, pluginName);
           
-          compilationResult = await compilePlugin(prompt, req.headers.authorization?.split(' ')[1] || '', validatedFiles);
+          compilationResult = await compilePlugin(
+            prompt, 
+            req.headers.authorization?.split(' ')[1] || '', 
+            validatedFiles,
+            buildId
+          );
           buildId = compilationResult.buildId;
           
           // Send response with compilation results
@@ -1131,20 +1177,12 @@ buildRoutes.get(
       console.log(`Checking status for buildId: ${buildId}`);
       
       const pluginDir = path.join(PLUGINS_BASE_DIR, buildId);
-      console.log(`Looking for directory: ${pluginDir}`);
-      console.log(`Directory exists: ${fs.existsSync(pluginDir)}`);
       
       if (!fs.existsSync(pluginDir)) {
-        console.log(`Build directory not found: ${pluginDir}`);
-        
-        // List all available build directories for debugging
-        const existingBuilds = fs.readdirSync(PLUGINS_BASE_DIR);
-        console.log(`Available builds: ${existingBuilds.join(', ')}`);
-        
-        res.status(404).json({
-          success: false,
-          message: `Build ${buildId} not found`
-        });
+        res.status(404).json(formatApiResponse(
+          false,
+          `Build ${buildId} not found`
+        ));
         return;
       }
       
@@ -1162,38 +1200,68 @@ buildRoutes.get(
         }
       }
       
-      // Get list of all files in the plugin directory
-      const allFiles: string[] = [];
-      function walkDir(dir: string, baseDir: string): void {
-        const files = fs.readdirSync(dir);
-        for (const file of files) {
-          const filePath = path.join(dir, file);
-          const stat = fs.statSync(filePath);
-          if (stat.isDirectory() && file !== 'target') {
-            walkDir(filePath, baseDir);
-          } else if (stat.isFile()) {
-            allFiles.push(path.relative(baseDir, filePath));
+      // Get plugin name for better response
+      let pluginName = "Unknown";
+      try {
+        const possiblePaths = [
+          path.join(pluginDir, 'src', 'main', 'resources', 'plugin.yml'),
+          path.join(pluginDir, 'plugin.yml')
+        ];
+        
+        for (const ymlPath of possiblePaths) {
+          if (fs.existsSync(ymlPath)) {
+            const pluginYml = fs.readFileSync(ymlPath, 'utf8');
+            const nameMatch = pluginYml.match(/name: *([A-Za-z0-9_]+)/);
+            if (nameMatch) {
+              pluginName = nameMatch[1];
+              break;
+            }
           }
         }
+      } catch (error) {
+        console.warn(`Could not read plugin.yml:`, error);
       }
       
-      walkDir(pluginDir, pluginDir);
+      // Only get files if requested to speed up response
+      const allFiles: string[] | null = req.query.includeFiles === 'true' ? [] : null;
+      if (allFiles !== null) {
+        function walkDir(dir: string, baseDir: string): void {
+          const files = fs.readdirSync(dir);
+          for (const file of files) {
+            const filePath = path.join(dir, file);
+            const stat = fs.statSync(filePath);
+            if (stat.isDirectory() && file !== 'target') {
+              walkDir(filePath, baseDir);
+            } else if (stat.isFile()) {
+              // Use non-null assertion since we already checked outside the function
+              allFiles!.push(path.relative(baseDir, filePath));
+            }
+          }
+        }
+        
+        walkDir(pluginDir, pluginDir);
+      }
       
-      res.json({
-        success: true,
-        buildId: buildId,
-        status: jarFile ? 'completed' : targetExists ? 'failed' : 'pending',
-        jarFile: jarFile,
-        files: allFiles
-      });
+      res.json(formatApiResponse(
+        true, 
+        `Build status retrieved for ${buildId}`,
+        {
+          buildId,
+          status: jarFile ? 'completed' : targetExists ? 'failed' : 'pending',
+          jarFile,
+          pluginName,
+          files: allFiles,
+          downloadUrl: jarFile ? `/api/build/download/${buildId}` : null
+        }
+      ));
       
     } catch (error) {
       console.error("Error checking build status:", error);
-      res.status(500).json({
-        success: false,
-        message: "Failed to check build status",
-        error: (error as Error).message
-      });
+      res.status(500).json(formatApiResponse(
+        false,
+        "Failed to check build status",
+        { error: (error as Error).message }
+      ));
     }
   }
 );
@@ -1208,20 +1276,20 @@ buildRoutes.get(
       const pluginDir = path.join(PLUGINS_BASE_DIR, buildId);
       
       if (!fs.existsSync(pluginDir)) {
-        res.status(404).json({
-          success: false,
-          message: `Build ${buildId} not found`
-        });
+        res.status(404).json(formatApiResponse(
+          false,
+          `Build ${buildId} not found`
+        ));
         return;
       }
       
       // Find JAR file in the target directory
       const targetDir = path.join(pluginDir, 'target');
       if (!fs.existsSync(targetDir)) {
-        res.status(404).json({
-          success: false,
-          message: `No target directory found for build ${buildId}`
-        });
+        res.status(404).json(formatApiResponse(
+          false,
+          `No target directory found for build ${buildId}`
+        ));
         return;
       }
       
@@ -1230,18 +1298,42 @@ buildRoutes.get(
       const jarFile = files.find(file => file.endsWith('.jar') && !file.includes('original'));
       
       if (!jarFile) {
-        res.status(404).json({
-          success: false,
-          message: `No JAR file found for build ${buildId}`
-        });
+        res.status(404).json(formatApiResponse(
+          false,
+          `No JAR file found for build ${buildId}`
+        ));
         return;
       }
       
       const jarPath = path.join(targetDir, jarFile);
       
-      // Set headers for file download
-      res.setHeader('Content-Disposition', `attachment; filename=${jarFile}`);
+      // Get plugin name for better filename
+      let pluginName = "";
+      try {
+        const possiblePaths = [
+          path.join(pluginDir, 'src', 'main', 'resources', 'plugin.yml'),
+          path.join(pluginDir, 'plugin.yml')
+        ];
+        
+        for (const ymlPath of possiblePaths) {
+          if (fs.existsSync(ymlPath)) {
+            const pluginYml = fs.readFileSync(ymlPath, 'utf8');
+            const nameMatch = pluginYml.match(/name: *([A-Za-z0-9_]+)/);
+            if (nameMatch) {
+              pluginName = nameMatch[1].toLowerCase();
+              break;
+            }
+          }
+        }
+      } catch (error) {
+        console.warn(`Could not read plugin.yml:`, error);
+      }
+      
+      // Set proper headers for file download
+      res.setHeader('Content-Disposition', `attachment; filename="${pluginName || jarFile}"`);
       res.setHeader('Content-Type', 'application/java-archive');
+      res.setHeader('Content-Length', fs.statSync(jarPath).size);
+      res.setHeader('Cache-Control', 'no-store, max-age=0');
       
       // Stream the file
       const fileStream = fs.createReadStream(jarPath);
@@ -1249,11 +1341,11 @@ buildRoutes.get(
       
     } catch (error) {
       console.error("Error downloading JAR:", error);
-      res.status(500).json({
-        success: false,
-        message: "Failed to download JAR file",
-        error: (error as Error).message
-      });
+      res.status(500).json(formatApiResponse(
+        false,
+        "Failed to download JAR file",
+        { error: (error as Error).message }
+      ));
     }
   }
 );
@@ -1272,10 +1364,10 @@ pluginsRoutes.get(
       
       // Check if plugins directory exists
       if (!fs.existsSync(PLUGINS_BASE_DIR)) {
-        res.status(404).json({
-          success: false,
-          message: "Plugins directory not found"
-        });
+        res.status(404).json(formatApiResponse(
+          false,
+          "Plugins directory not found"
+        ));
         return;
       }
       
@@ -1412,20 +1504,23 @@ pluginsRoutes.get(
         return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
       });
       
-      res.json({
-        success: true,
-        plugins,
-        count: plugins.length,
-        baseDir: PLUGINS_BASE_DIR
-      });
+      res.json(formatApiResponse(
+        true,
+        "Plugins retrieved successfully",
+        {
+          plugins,
+          count: plugins.length,
+          baseDir: PLUGINS_BASE_DIR
+        }
+      ));
       
     } catch (error) {
       console.error("Error listing plugins:", error);
-      res.status(500).json({
-        success: false,
-        message: "Failed to list plugins",
-        error: (error as Error).message
-      });
+      res.status(500).json(formatApiResponse(
+        false,
+        "Failed to list plugins",
+        { error: (error as Error).message }
+      ));
     }
   }
 );
@@ -1558,28 +1653,32 @@ pluginsRoutes.get(
         console.warn(`Could not read prompt for ${buildId}:`, error);
       }
       
-      res.json({
-        success: true,
-        plugin: {
-          id: buildId,
-          name: pluginName,
-          status,
-          createdAt,
-          jarFile,
-          fileCount: files.length,
-          files,
-          fileContents,
-          prompt
+      res.json(formatApiResponse(
+        true,
+        `Plugin ${buildId} details retrieved successfully`,
+        {
+          plugin: {
+            id: buildId,
+            name: pluginName,
+            status,
+            createdAt,
+            jarFile,
+            fileCount: files.length,
+            files,
+            fileContents,
+            prompt,
+            downloadUrl: jarFile ? `/api/build/download/${buildId}` : null
+          }
         }
-      });
+      ));
       
     } catch (error) {
       console.error(`Error getting plugin ${req.params.buildId}:`, error);
-      res.status(500).json({
-        success: false,
-        message: "Failed to get plugin details",
-        error: (error as Error).message
-      });
+      res.status(500).json(formatApiResponse(
+        false,
+        "Failed to get plugin details",
+        { error: (error as Error).message }
+      ));
     }
   }
 );
